@@ -7,8 +7,8 @@ for use by amateurs, academics and professionals.
 
 * The data is entirely anonymised, no personally identifiable information is stored or made available.
 
-* The data consists of aggregate information about workouts and base information about the athlete that performed the workout (such as age and gender).
+* We store one file per athlete, with each file containing a summary json plus csv files for each activity
 
-* The data is provided by users of the GoldenCheetah analysis application and is provided as-is with no warranty or liability.
+* We publish the actual data to an Amazon S3 bucket here: http://goldencheetah.s3.eu-west-2.amazonaws.com/
 
-The data is published under a creative commons license.
+* This repo provides tools for working with the data
