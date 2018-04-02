@@ -9,6 +9,6 @@ for use by amateurs, academics and professionals.
 
 * We store one file per athlete, with each file containing a summary json plus csv files for each activity
 
-* We publish the actual data to an Open Science Foundation project here: https://osf.io/6hfpz/ (DOI 10.17605/OSF.IO/6HFPZ)
+* We publish the actual data to an Open Science Framework project here: https://osf.io/6hfpz/ (DOI 10.17605/OSF.IO/6HFPZ)
 
 * This repo provides tools for working with the data
