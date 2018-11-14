@@ -11,4 +11,6 @@ for use by amateurs, academics and professionals.
 
 * We publish the actual data to an Open Science Framework project here: https://osf.io/6hfpz/ (DOI 10.17605/OSF.IO/6HFPZ)
 
+* From November 2018 we additionally published the data to a publically readable AWS 23 bucket: https://goldencheetah-opendata.s3.amazonaws.com
+
 * This repo provides tools for working with the data
