@@ -1,0 +1,12 @@
+# Python
+.tox
+.eggs
+.ipynb_checkpoints
+.python-version
+*.egg-info
+*.pyc
+__pycache__
+build
+dist
+Pipfile
+Pipfile.lock
