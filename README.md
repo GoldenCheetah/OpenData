@@ -13,4 +13,4 @@ for use by amateurs, academics and professionals.
 
 * From November 2018 we additionally published the data to a publically readable AWS S3 bucket: http://goldencheetah-opendata.s3-website-us-east-1.amazonaws.com/ 
 
-* This repo provides tools for working with the data
+* This repo provides tools for working with the data. There already is a Python library available, see [documentation](opendata-python/README.md) for more details.
