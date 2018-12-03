@@ -112,3 +112,10 @@ class TestRemoteAthlete:
             os.listdir(os.path.join(local_storage.strpath, settings.data_prefix))
         assert f'{{{remote_athlete.id}}}.json' in \
             os.listdir(os.path.join(local_storage.strpath, settings.metadata_prefix))
+
+    def test_store_locally_no_data(self, remote_athlete, local_storage):
+            remote_athlete.store_locally(data=False)
+            assert remote_athlete.id in \
+                os.listdir(os.path.join(local_storage.strpath, settings.data_prefix))
+            assert f'{{{remote_athlete.id}}}.json' in \
+                os.listdir(os.path.join(local_storage.strpath, settings.metadata_prefix))

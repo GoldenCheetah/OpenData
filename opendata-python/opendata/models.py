@@ -138,6 +138,7 @@ class RemoteAthlete(BaseAthlete):
             break
         return self.transform_metadata(metadata)
 
-    def store_locally(self):
-        self.data_zip.extractall(path=os.path.join(settings.local_storage, settings.data_prefix, self.id))  # noqa: E501
+    def store_locally(self, data=True):
+        if data:
+            self.data_zip.extractall(path=os.path.join(settings.local_storage, settings.data_prefix, self.id))  # noqa: E501
         self.metadata_zip.extractall(path=os.path.join(settings.local_storage, settings.metadata_prefix))  # noqa: E501
