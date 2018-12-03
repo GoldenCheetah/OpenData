@@ -14,7 +14,7 @@ class OpenData(LocalStorageMixin, RemoteMixin):
         return RemoteAthlete(athlete_id)
 
     def local_athletes(self):
-        for path in self.local_data():
+        for path in self.local_metadata():
             athlete_id = os.path.split(os.path.split(path)[0])[-1]
             yield LocalAthlete(athlete_id)
 
