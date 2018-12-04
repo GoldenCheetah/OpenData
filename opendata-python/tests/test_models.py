@@ -27,7 +27,7 @@ class TestActivity:
 class TestBaseAthlete:
     def test___init__(self):
         base_athlete = models.BaseAthlete('some-athlete-id-1')
-        
+
         assert base_athlete.id == 'some-athlete-id-1'
 
     def test___eq__(self):
@@ -113,9 +113,22 @@ class TestRemoteAthlete:
         assert f'{{{remote_athlete.id}}}.json' in \
             os.listdir(os.path.join(local_storage.strpath, settings.metadata_prefix))
 
-    def test_store_locally_no_data(self, remote_athlete, local_storage):
-            remote_athlete.store_locally(data=False)
-            assert remote_athlete.id in \
-                os.listdir(os.path.join(local_storage.strpath, settings.data_prefix))
-            assert f'{{{remote_athlete.id}}}.json' in \
-                os.listdir(os.path.join(local_storage.strpath, settings.metadata_prefix))
+
+class TestRemoteAthleteLocalStoringOptions:
+    @pytest.fixture
+    def remote_athlete(self):
+        return models.RemoteAthlete('009daa84-3253-4967-93fe-ebdb0fa93339')
+
+    def test_store_locally_with_data(self, remote_athlete, local_storage):
+        remote_athlete.store_locally()
+        assert remote_athlete.id in \
+            os.listdir(os.path.join(local_storage.strpath, settings.data_prefix))
+        assert f'{{{remote_athlete.id}}}.json' in \
+            os.listdir(os.path.join(local_storage.strpath, settings.metadata_prefix))
+
+    def test_store_locally_wo_data(self, remote_athlete, local_storage):
+        remote_athlete.store_locally(data=False)
+        assert remote_athlete.id not in \
+            os.listdir(os.path.join(local_storage.strpath, settings.data_prefix))
+        assert f'{{{remote_athlete.id}}}.json' in \
+            os.listdir(os.path.join(local_storage.strpath, settings.metadata_prefix))
