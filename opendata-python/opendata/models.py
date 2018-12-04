@@ -4,6 +4,7 @@ from io import BytesIO
 import json
 import os
 from zipfile import ZipFile
+import warnings
 
 import boto3
 from botocore.handlers import disable_signing
@@ -139,6 +140,17 @@ class RemoteAthlete(BaseAthlete):
         return self.transform_metadata(metadata)
 
     def store_locally(self, data=True):
+        """
+        Parameters
+        ----------
+        data: bool (default=True)
+            When True saves the data alongside the metadata, otherwise saves
+            only the metadata
+        """
         if data:
-            self.data_zip.extractall(path=os.path.join(settings.local_storage, settings.data_prefix, self.id))  # noqa: E501
+            self.data_zip.extractall(path=os.path.join(settings.local_storage,
+                                                       settings.data_prefix,
+                                                     self.id))  # noqa: E501
+        else:
+            warnings.warn(f'Only metadata will be stored for {self.id}')
         self.metadata_zip.extractall(path=os.path.join(settings.local_storage, settings.metadata_prefix))  # noqa: E501
