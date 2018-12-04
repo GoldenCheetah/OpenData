@@ -57,6 +57,15 @@ To store this athlete athlete locally:
 athlete.store_locally()
 ```
 
+To store only the metadata:
+```python
+athlete.store_locally(data=False)
+```
+the rest of the data could always be retrieved later:
+```python
+athlete.download_remote_data()
+```
+
 ### Working with local data storage
 List all local athletes.
 ```python

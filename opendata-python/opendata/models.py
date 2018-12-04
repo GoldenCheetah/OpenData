@@ -75,6 +75,11 @@ class LocalAthlete(BaseAthlete):
 
         return self.activities_generator()
 
+    def download_remote_data(self):
+        a = RemoteAthlete(self.id)
+        a.store_locally()
+
+
     @utils.lazy_load
     def metadata(self):
         with open(os.path.join(settings.local_storage, settings.metadata_prefix, f'{{{self.id}}}.json')) as f:  # noqa: E501
@@ -150,7 +155,8 @@ class RemoteAthlete(BaseAthlete):
         if data:
             self.data_zip.extractall(path=os.path.join(settings.local_storage,
                                                        settings.data_prefix,
-                                                     self.id))  # noqa: E501
+                                                       self.id))  # noqa: E501
         else:
-            warnings.warn(f'Only metadata will be stored for {self.id}')
+            warnings.warn(f'Only metadata will be stored for {self.id}',
+                          stacklevel=2)
         self.metadata_zip.extractall(path=os.path.join(settings.local_storage, settings.metadata_prefix))  # noqa: E501

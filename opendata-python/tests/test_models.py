@@ -81,6 +81,11 @@ class TestLocalAthlete:
         assert local_athlete.metadata['ATHLETE'] == 'some metadata'
         assert hasattr(local_athlete, '_lazy_metadata')
 
+    @pytest.mark.aws_s3
+    def test_download_remote_data(self, local_athlete):
+        local_athlete.download_remote_data()
+        pass
+
 
 @pytest.mark.aws_s3
 class TestRemoteAthlete:
