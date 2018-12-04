@@ -79,7 +79,6 @@ class LocalAthlete(BaseAthlete):
         a = RemoteAthlete(self.id)
         a.store_locally()
 
-
     @utils.lazy_load
     def metadata(self):
         with open(os.path.join(settings.local_storage, settings.metadata_prefix, f'{{{self.id}}}.json')) as f:  # noqa: E501
