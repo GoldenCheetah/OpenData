@@ -8,20 +8,33 @@ import pytest
 
 
 class TestActivity:
-    def test_init(self, local_storage):
-        activity = models.Activity(
+    def __init__(self, local_storage):
+        self.activity = models.Activity(
             id='1970_01_01_00_00_00.csv',
             filepath_or_buffer=\
-                os.path.join(local_storage.strpath, settings.data_prefix, 'some-athlete-id-1', '1970_01_01_00_00_00.csv')
+                os.path.join(local_storage.strpath,
+                             settings.data_prefix,
+                             'some-athlete-id-1',
+                             '1970_01_01_00_00_00.csv')
         )
+        return self
 
+    def test_init(self, local_storage):
+        activity = self.activity
         assert activity.id == '1970_01_01_00_00_00.csv'
         assert activity.filepath_or_buffer == \
-            os.path.join(local_storage.strpath, settings.data_prefix, 'some-athlete-id-1', '1970_01_01_00_00_00.csv')
+            os.path.join(local_storage.strpath,
+                         settings.data_prefix,
+                         'some-athlete-id-1',
+                         '1970_01_01_00_00_00.csv')
         assert 'secs' in activity.data
         assert 'power' in activity.data
         assert 'heartrate' in activity.data
         assert activity.data.power[0] == 200
+
+    def test_data_not_stored_locally(self, local_storage):
+        data = self.activity.data()
+        assert data is not None
 
 
 class TestBaseAthlete:
@@ -66,6 +79,10 @@ class TestLocalAthlete:
     def test_get_activity(self, local_athlete):
         activity = local_athlete.get_activity('1970_01_01_00_00_00.csv')
         assert isinstance(activity, models.Activity)
+
+    def test_get_missing_activity(self, local_athlete):
+        activity = local_athlete.get_activity('missing_id')
+        assert activity is None
 
     def test_activities(self, local_athlete):
         activities = local_athlete.activities()

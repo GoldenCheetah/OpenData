@@ -22,6 +22,7 @@ class Activity:
 
     @utils.lazy_load
     def data(self):
+
         return pd.read_csv(self.filepath_or_buffer)
 
 
@@ -50,15 +51,25 @@ class BaseAthlete:
 
 class LocalAthlete(BaseAthlete):
     def get_activity(self, activity_id):
-        filepath = os.path.join(settings.local_storage, settings.data_prefix, self.id, activity_id)
-        activity = Activity(activity_id, filepath)
+        filepath = os.path.join(settings.local_storage,
+                                settings.data_prefix,
+                                self.id,
+                                activity_id)
+        try:
+            activity = Activity(activity_id, filepath)
 
-        date_string = utils.match_filename_to_date_strings(
-            filename=activity_id,
-            date_strings=self.metadata['RIDES'].keys()
-        )
-        activity.metadata = self.metadata['RIDES'][date_string]
-
+            date_string = utils.match_filename_to_date_strings(
+                filename=activity_id,
+                date_strings=self.metadata['RIDES'].keys()
+            )
+            activity.metadata = self.metadata['RIDES'][date_string]
+        except:
+            warnings.warn(f"""Activity with id={activity_id}
+            was not found in local storage.
+            Consider running Athlete.download_remote_data()
+            to to ensure all activities are downloaded""",
+            stacklevel=2)
+            activity = None
         return activity
 
     def activities_generator(self):
@@ -155,7 +166,4 @@ class RemoteAthlete(BaseAthlete):
             self.data_zip.extractall(path=os.path.join(settings.local_storage,
                                                        settings.data_prefix,
                                                        self.id))  # noqa: E501
-        else:
-            warnings.warn(f'Only metadata will be stored for {self.id}',
-                          stacklevel=2)
         self.metadata_zip.extractall(path=os.path.join(settings.local_storage, settings.metadata_prefix))  # noqa: E501
