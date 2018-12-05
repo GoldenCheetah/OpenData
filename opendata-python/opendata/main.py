@@ -1,4 +1,4 @@
-import os
+import re
 
 from .mixins import LocalStorageMixin, RemoteMixin
 from .models import LocalAthlete, RemoteAthlete
@@ -14,8 +14,9 @@ class OpenData(LocalStorageMixin, RemoteMixin):
         return RemoteAthlete(athlete_id)
 
     def local_athletes(self):
-        for path in self.local_data():
-            athlete_id = os.path.split(os.path.split(path)[0])[-1]
+        for f_name in self.local_metadata():
+            regex = r"\{(.*?)\}"
+            athlete_id = re.findall(regex, f_name)[0]
             yield LocalAthlete(athlete_id)
 
     def get_local_athlete(self, athlete_id):

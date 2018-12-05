@@ -55,17 +55,23 @@ class TestLocalStorageMixin:
     def test_local_data_dirname(self, local_storage):
         instance = mixins.LocalStorageMixin()
         data = instance.local_data('1970_01_01_00_00_00.csv')
-        assert data == os.path.join(local_storage.strpath, settings.data_prefix, '1970_01_01_00_00_00.csv')
+        assert data == os.path.join(local_storage.strpath,
+                                    settings.data_prefix,
+                                    '1970_01_01_00_00_00.csv')
 
     def test_local_metadata(self, local_storage):
         instance = mixins.LocalStorageMixin()
         data = list(instance.local_metadata())
         assert len(data) == 2
+        assert data[0] == '{some-athlete-id-0}.json'
+        assert data[1] == '{some-athlete-id-1}.json'
 
     def test_local_metadata_filename(self, local_storage):
         instance = mixins.LocalStorageMixin()
         data = instance.local_metadata('some-athlete-id-1')
-        assert data == os.path.join(local_storage.strpath, settings.metadata_prefix, 'some-athlete-id-1')
+        assert data == os.path.join(local_storage.strpath,
+                                    settings.metadata_prefix,
+                                    'some-athlete-id-1')
 
     def test_local_datasets(self, local_storage):
         instance = mixins.LocalStorageMixin()

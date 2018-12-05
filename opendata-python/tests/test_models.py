@@ -12,22 +12,38 @@ class TestActivity:
         activity = models.Activity(
             id='1970_01_01_00_00_00.csv',
             filepath_or_buffer=\
-                os.path.join(local_storage.strpath, settings.data_prefix, 'some-athlete-id-1', '1970_01_01_00_00_00.csv')
+                os.path.join(local_storage.strpath,
+                             settings.data_prefix,
+                             'some-athlete-id-1',
+                             '1970_01_01_00_00_00.csv')
         )
-
         assert activity.id == '1970_01_01_00_00_00.csv'
         assert activity.filepath_or_buffer == \
-            os.path.join(local_storage.strpath, settings.data_prefix, 'some-athlete-id-1', '1970_01_01_00_00_00.csv')
+            os.path.join(local_storage.strpath,
+                         settings.data_prefix,
+                         'some-athlete-id-1',
+                         '1970_01_01_00_00_00.csv')
         assert 'secs' in activity.data
         assert 'power' in activity.data
         assert 'heartrate' in activity.data
         assert activity.data.power[0] == 200
 
+    def test_init__not_stored_locally(self, local_storage):
+        activity = models.Activity(
+            id='not_stored_activity.csv',
+            filepath_or_buffer=\
+                os.path.join(local_storage.strpath,
+                             settings.data_prefix,
+                             'some-athlete-id-1',
+                             'not_stored_activity.csv')
+        )
+        assert activity is not None
+
 
 class TestBaseAthlete:
     def test___init__(self):
         base_athlete = models.BaseAthlete('some-athlete-id-1')
-        
+
         assert base_athlete.id == 'some-athlete-id-1'
 
     def test___eq__(self):
@@ -67,6 +83,10 @@ class TestLocalAthlete:
         activity = local_athlete.get_activity('1970_01_01_00_00_00.csv')
         assert isinstance(activity, models.Activity)
 
+    def test_get_missing_activity(self, local_athlete):
+        activity = local_athlete.get_activity('missing_id')
+        assert activity is None
+
     def test_activities(self, local_athlete):
         activities = local_athlete.activities()
 
@@ -80,6 +100,12 @@ class TestLocalAthlete:
         assert not hasattr(local_athlete, '_lazy_metadata')
         assert local_athlete.metadata['ATHLETE'] == 'some metadata'
         assert hasattr(local_athlete, '_lazy_metadata')
+
+    @pytest.mark.aws_s3
+    def test_download_remote_data(self):
+        # TOTO: to be implemented
+        # local_athlete.download_remote_data()
+        pass
 
 
 @pytest.mark.aws_s3
@@ -109,6 +135,13 @@ class TestRemoteAthlete:
     def test_store_locally(self, remote_athlete, local_storage):
         remote_athlete.store_locally()
         assert remote_athlete.id in \
+            os.listdir(os.path.join(local_storage.strpath, settings.data_prefix))
+        assert f'{{{remote_athlete.id}}}.json' in \
+            os.listdir(os.path.join(local_storage.strpath, settings.metadata_prefix))
+
+    def test_store_locally_wo_data(self, remote_athlete, local_storage):
+        remote_athlete.store_locally(data=False)
+        assert remote_athlete.id not in \
             os.listdir(os.path.join(local_storage.strpath, settings.data_prefix))
         assert f'{{{remote_athlete.id}}}.json' in \
             os.listdir(os.path.join(local_storage.strpath, settings.metadata_prefix))

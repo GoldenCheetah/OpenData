@@ -4,6 +4,7 @@ from io import BytesIO
 import json
 import os
 from zipfile import ZipFile
+import warnings
 
 import boto3
 from botocore.handlers import disable_signing
@@ -21,7 +22,15 @@ class Activity:
 
     @utils.lazy_load
     def data(self):
-        return pd.read_csv(self.filepath_or_buffer)
+        if not os.path.isfile(self.filepath_or_buffer):
+            warnings.warn(f"""Activity with id={id}
+            was not found in local storage.
+            Consider running Athlete.download_remote_data()
+            to to ensure all activities are downloaded""", stacklevel=2)
+            data = None
+        else:
+            data = pd.read_csv(self.filepath_or_buffer)
+        return data
 
 
 class BaseAthlete:
@@ -49,15 +58,25 @@ class BaseAthlete:
 
 class LocalAthlete(BaseAthlete):
     def get_activity(self, activity_id):
-        filepath = os.path.join(settings.local_storage, settings.data_prefix, self.id, activity_id)
-        activity = Activity(activity_id, filepath)
+        filepath = os.path.join(settings.local_storage,
+                                settings.data_prefix,
+                                self.id,
+                                activity_id)
+        try:
+            activity = Activity(activity_id, filepath)
 
-        date_string = utils.match_filename_to_date_strings(
-            filename=activity_id,
-            date_strings=self.metadata['RIDES'].keys()
-        )
-        activity.metadata = self.metadata['RIDES'][date_string]
-
+            date_string = utils.match_filename_to_date_strings(
+                filename=activity_id,
+                date_strings=self.metadata['RIDES'].keys()
+            )
+            activity.metadata = self.metadata['RIDES'][date_string]
+        except:
+            warnings.warn(f"""Activity with id={activity_id}
+            was not found in local storage.
+            Consider running Athlete.download_remote_data()
+            to to ensure all activities are downloaded""",
+            stacklevel=2)
+            activity = None
         return activity
 
     def activities_generator(self):
@@ -73,6 +92,10 @@ class LocalAthlete(BaseAthlete):
             ))
 
         return self.activities_generator()
+
+    def download_remote_data(self):
+        a = RemoteAthlete(self.id)
+        a.store_locally()
 
     @utils.lazy_load
     def metadata(self):
@@ -138,6 +161,16 @@ class RemoteAthlete(BaseAthlete):
             break
         return self.transform_metadata(metadata)
 
-    def store_locally(self):
-        self.data_zip.extractall(path=os.path.join(settings.local_storage, settings.data_prefix, self.id))  # noqa: E501
+    def store_locally(self, data=True):
+        """
+        Parameters
+        ----------
+        data: bool (default=True)
+            When True saves the data alongside the metadata, otherwise saves
+            only the metadata
+        """
+        if data:
+            self.data_zip.extractall(path=os.path.join(settings.local_storage,
+                                                       settings.data_prefix,
+                                                       self.id))  # noqa: E501
         self.metadata_zip.extractall(path=os.path.join(settings.local_storage, settings.metadata_prefix))  # noqa: E501

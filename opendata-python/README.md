@@ -57,6 +57,17 @@ To store this athlete athlete locally:
 athlete.store_locally()
 ```
 
+To store only the metadata:
+```python
+athlete.store_locally(data=False)
+```
+the rest of the data could always be retrieved later:
+```python
+from opendata.models import LocalAthlete
+local_athlete = LocalAthlete(athlete.id)
+local_athlete.download_remote_data()
+```
+
 ### Working with local data storage
 List all local athletes.
 ```python
