@@ -99,8 +99,9 @@ class TestLocalAthlete:
         assert hasattr(local_athlete, '_lazy_metadata')
 
     @pytest.mark.aws_s3
-    def test_download_remote_data(self, local_athlete):
-        local_athlete.download_remote_data()
+    def test_download_remote_data(self):
+        # TOTO: to be implemented
+        # local_athlete.download_remote_data()
         pass
 
 
