@@ -19,10 +19,14 @@ class Activity:
         self.id = id
         self.filepath_or_buffer = filepath_or_buffer
         self.metadata = None
+        if os.path.isfile(filepath_or_buffer):
+            warnings.warn(f"""Activity with id={id}
+            was not found in local storage.
+            Consider running Athlete.download_remote_data()
+            to to ensure all activities are downloaded""", stacklevel=2)
 
     @utils.lazy_load
     def data(self):
-
         return pd.read_csv(self.filepath_or_buffer)
 
 
