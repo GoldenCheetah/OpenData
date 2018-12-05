@@ -8,8 +8,8 @@ import pytest
 
 
 class TestActivity:
-    def __init__(self, local_storage):
-        self.activity = models.Activity(
+    def test_init(self, local_storage):
+        activity = models.Activity(
             id='1970_01_01_00_00_00.csv',
             filepath_or_buffer=\
                 os.path.join(local_storage.strpath,
@@ -17,10 +17,6 @@ class TestActivity:
                              'some-athlete-id-1',
                              '1970_01_01_00_00_00.csv')
         )
-        return self
-
-    def test_init(self, local_storage):
-        activity = self.activity
         assert activity.id == '1970_01_01_00_00_00.csv'
         assert activity.filepath_or_buffer == \
             os.path.join(local_storage.strpath,
@@ -32,9 +28,16 @@ class TestActivity:
         assert 'heartrate' in activity.data
         assert activity.data.power[0] == 200
 
-    def test_data_not_stored_locally(self, local_storage):
-        data = self.activity.data()
-        assert data is not None
+    def test_init__not_stored_locally(self, local_storage):
+        activity = models.Activity(
+            id='not_stored_activity.csv',
+            filepath_or_buffer=\
+                os.path.join(local_storage.strpath,
+                             settings.data_prefix,
+                             'some-athlete-id-1',
+                             'not_stored_activity.csv')
+        )
+        assert activity is not None
 
 
 class TestBaseAthlete:
