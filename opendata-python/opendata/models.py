@@ -173,8 +173,4 @@ class RemoteAthlete(BaseAthlete):
             self.data_zip.extractall(path=os.path.join(settings.local_storage,
                                                        settings.data_prefix,
                                                        self.id))  # noqa: E501
-        else:
-            warnings.warn(f"""Only metatada will be stored locally for {self.id}.
-                             Data can be fetched later by calling Athlete.download_remote_data()""",
-                             stacklevel=2)
         self.metadata_zip.extractall(path=os.path.join(settings.local_storage, settings.metadata_prefix))  # noqa: E501
