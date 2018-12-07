@@ -63,8 +63,8 @@ class TestLocalStorageMixin:
         instance = mixins.LocalStorageMixin()
         data = list(instance.local_metadata())
         assert len(data) == 2
-        assert data[0] == '{some-athlete-id-0}.json'
-        assert data[1] == '{some-athlete-id-1}.json'
+        assert '{some-athlete-id-0}.json' in data
+        assert '{some-athlete-id-1}.json' in data
 
     def test_local_metadata_filename(self, local_storage):
         instance = mixins.LocalStorageMixin()
