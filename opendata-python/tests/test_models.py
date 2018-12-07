@@ -15,8 +15,8 @@ class TestActivity:
                 os.path.join(local_storage.strpath,
                              settings.data_prefix,
                              'some-athlete-id-1',
-                             '1970_01_01_00_00_00.csv')
-        )
+                             '1970_01_01_00_00_00.csv'),
+            metadata={})
         assert activity.id == '1970_01_01_00_00_00.csv'
         assert activity.filepath_or_buffer == \
             os.path.join(local_storage.strpath,
@@ -35,9 +35,13 @@ class TestActivity:
                 os.path.join(local_storage.strpath,
                              settings.data_prefix,
                              'some-athlete-id-1',
-                             'not_stored_activity.csv')
+                             'not_stored_activity.csv'),
+            metadata={},
         )
-        assert activity is not None
+        assert activity.metadata is None
+        assert not activity.has_data()
+        with pytest.raises(FileNotFoundError):
+            activity.data
 
 
 class TestBaseAthlete:
@@ -84,8 +88,11 @@ class TestLocalAthlete:
         assert isinstance(activity, models.Activity)
 
     def test_get_missing_activity(self, local_athlete):
-        activity = local_athlete.get_activity('missing_id')
-        assert activity is None
+        activity = local_athlete.get_activity('1900_01_01_00_00_00.csv')
+        assert not activity.has_data()
+        assert activity.metadata is None
+        with pytest.raises(FileNotFoundError):
+            activity.data
 
     def test_activities(self, local_athlete):
         activities = local_athlete.activities()

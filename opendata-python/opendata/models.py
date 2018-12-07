@@ -4,7 +4,6 @@ from io import BytesIO
 import json
 import os
 from zipfile import ZipFile
-import warnings
 
 import boto3
 from botocore.handlers import disable_signing
@@ -15,21 +14,30 @@ from .conf import settings
 
 
 class Activity:
-    def __init__(self, id, filepath_or_buffer):
+    def __init__(self, id, filepath_or_buffer, metadata):
         self.id = id
         self.filepath_or_buffer = filepath_or_buffer
         self.metadata = None
 
+    def has_data(self):
+        if isinstance(self.filepath_or_buffer, str) \
+                and not os.path.exists(self.filepath_or_buffer):
+            return False
+        else:
+            return True
+
     @utils.lazy_load
     def data(self):
-        if not os.path.isfile(self.filepath_or_buffer):
-            warnings.warn(f"""Activity with id={id}
-            was not found in local storage.
-            Consider running Athlete.download_remote_data()
-            to to ensure all activities are downloaded""", stacklevel=2)
-            data = None
-        else:
+        try:
             data = pd.read_csv(self.filepath_or_buffer)
+        except FileNotFoundError:
+            raise FileNotFoundError((
+                f'Data for activity with id={self.id} was not found in local storage. '
+                f'It seems that only metadata is downloaded. '
+                f'Run \'RemoteAthlete({{athlete_id}}).store_locally()\' to download data '
+                f'for this athlete.'
+            ))
+
         return data
 
 
@@ -57,40 +65,34 @@ class BaseAthlete:
 
 
 class LocalAthlete(BaseAthlete):
-    def get_activity(self, activity_id):
-        filepath = os.path.join(settings.local_storage,
-                                settings.data_prefix,
-                                self.id,
-                                activity_id)
-        try:
-            activity = Activity(activity_id, filepath)
+    def has_data(self):
+        return os.path.isdir(os.path.join(settings.local_storage, settings.data_prefix, self.id))
 
-            date_string = utils.match_filename_to_date_strings(
-                filename=activity_id,
-                date_strings=self.metadata['RIDES'].keys()
-            )
-            activity.metadata = self.metadata['RIDES'][date_string]
-        except:
-            warnings.warn(f"""Activity with id={activity_id}
-            was not found in local storage.
-            Consider running Athlete.download_remote_data()
-            to to ensure all activities are downloaded""",
-            stacklevel=2)
-            activity = None
-        return activity
+    def get_activity(self, activity_id):
+        data_filepath = os.path.join(
+            settings.local_storage,
+            settings.data_prefix,
+            self.id,
+            activity_id)
+
+        date_string = utils.match_filename_to_date_strings(
+            filename=activity_id,
+            date_strings=self.metadata['RIDES'].keys()
+        )
+        metadata = self.metadata['RIDES'][date_string]
+        return Activity(activity_id, data_filepath, metadata)
 
     def activities_generator(self):
-        for filepath in glob.glob(os.path.join(settings.local_storage, settings.data_prefix, self.id, '*.csv')):  # noqa: E501
-            filename = os.path.split(filepath)[-1]
-            yield self.get_activity(filename)
+        if self.has_data():
+            for filepath in glob.glob(os.path.join(settings.local_storage, settings.data_prefix,
+                                                   self.id, '*.csv')):
+                filename = os.path.split(filepath)[-1]
+                yield self.get_activity(filename)
+        else:
+            for ride in self.metadata['RIDES'].keys():
+                yield self.get_activity(utils.date_string_to_filename(ride))
 
     def activities(self):
-        if not os.path.isdir(os.path.join(settings.local_storage, settings.data_prefix, self.id)):
-            raise FileNotFoundError((
-                f'\'{self.id}\' does not exist. Consider running '
-                f'\'Athlete.load(allow_remote=True)\' to ensure all data is downloaded.'
-            ))
-
         return self.activities_generator()
 
     def download_remote_data(self):
@@ -99,7 +101,8 @@ class LocalAthlete(BaseAthlete):
 
     @utils.lazy_load
     def metadata(self):
-        with open(os.path.join(settings.local_storage, settings.metadata_prefix, f'{{{self.id}}}.json')) as f:  # noqa: E501
+        with open(os.path.join(settings.local_storage, settings.metadata_prefix,
+                               f'{{{self.id}}}.json')) as f:
             metadata = json.load(f)
         return self.transform_metadata(metadata)
 
@@ -129,13 +132,13 @@ class RemoteAthlete(BaseAthlete):
         return ZipFile(self.download_object_as_bytes(self.metadata_key))
 
     def get_activity(self, activity_id):
-        activity = Activity(activity_id, self.data_zip.open(activity_id))
         date_string = utils.match_filename_to_date_strings(
             filename=activity_id,
             date_strings=self.metadata['RIDES'].keys()
         )
-        activity.metadata = self.metadata['RIDES'][date_string]
-        return activity
+        metadata = self.metadata['RIDES'][date_string]
+
+        return Activity(activity_id, self.data_zip.open(activity_id), metadata)
 
     def activities_generator(self):
         for i in self.data_zip.filelist:
