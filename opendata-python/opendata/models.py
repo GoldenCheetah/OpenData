@@ -17,7 +17,7 @@ class Activity:
     def __init__(self, id, filepath_or_buffer, metadata):
         self.id = id
         self.filepath_or_buffer = filepath_or_buffer
-        self.metadata = None
+        self.metadata = metadata
 
     def has_data(self):
         if isinstance(self.filepath_or_buffer, str) \

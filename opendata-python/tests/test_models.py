@@ -27,6 +27,7 @@ class TestActivity:
         assert 'power' in activity.data
         assert 'heartrate' in activity.data
         assert activity.data.power[0] == 200
+        assert activity.metadata == {}
 
     def test_init__not_stored_locally(self, local_storage):
         activity = models.Activity(
@@ -38,7 +39,7 @@ class TestActivity:
                              'not_stored_activity.csv'),
             metadata={},
         )
-        assert activity.metadata is None
+        assert activity.metadata == {}
         assert not activity.has_data()
         with pytest.raises(FileNotFoundError):
             activity.data
@@ -90,7 +91,8 @@ class TestLocalAthlete:
     def test_get_missing_activity(self, local_athlete):
         activity = local_athlete.get_activity('1900_01_01_00_00_00.csv')
         assert not activity.has_data()
-        assert activity.metadata is None
+        assert activity.metadata is not None
+        assert 'date' in activity.metadata
         with pytest.raises(FileNotFoundError):
             activity.data
 
