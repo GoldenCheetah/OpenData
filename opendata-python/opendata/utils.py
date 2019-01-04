@@ -23,7 +23,9 @@ def match_filename_to_date_strings(filename, date_strings):
     This method tries to solve that by matching gradually less strict untill we find a match.
     It is not nice that we have to do this but it has to be done.
     """
-    dt = datetime.strptime(filename, FILENAME_FORMAT_WITH_EXTENSION)
+    r = re.compile(r'^(?P<date>\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}).*$')
+    date = r.fullmatch(filename).group('date')
+    dt = datetime.strptime(date, FILENAME_FORMAT)
 
     patterns = [
         fr'{dt.year:04}\/{dt.month:02}\/{dt.day:02} {dt.hour:02}:{dt.minute:02}:{dt.second:02} UTC',
@@ -33,10 +35,10 @@ def match_filename_to_date_strings(filename, date_strings):
         fr'\d{{4}}\/\d{{2}}\/\d{{2}} \d{{2}}:{dt.minute:02}:{dt.second:02} UTC',
     ]
     for pattern in patterns:
-        regex = re.compile(pattern)
-        results = list(filter(regex.search, date_strings))
-        if results:
-            return results[0]
+        r = re.compile(pattern)
+        result = next((s for s in date_strings if r.search(s)), None)
+        if result is not None:
+            return result
 
 
 def lazy_load(func):

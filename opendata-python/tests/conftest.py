@@ -38,6 +38,14 @@ def local_storage(tmpdir):
 
     return tmpdir
 
+@pytest.fixture(scope='function')
+def local_storage_invalid_metadata(local_storage):
+    with open(os.path.join(local_storage.strpath, settings.metadata_prefix,
+                           '{some-athlete-id-1}.json'), 'w+') as f:
+        f.write('bla_bla_invalid_json')
+    return local_storage
+
+
 
 def pytest_collection_modifyitems(items):
     # All tests requiring S3 are disabled by default.

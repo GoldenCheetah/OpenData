@@ -79,7 +79,10 @@ class LocalAthlete(BaseAthlete):
             filename=activity_id,
             date_strings=self.metadata['RIDES'].keys()
         )
-        metadata = self.metadata['RIDES'][date_string]
+        if self.metadata is not None:
+            metadata = self.metadata['RIDES'][date_string]
+        else:
+            metadata = None
         return Activity(activity_id, data_filepath, metadata)
 
     def activities_generator(self):
@@ -88,7 +91,7 @@ class LocalAthlete(BaseAthlete):
                                                    self.id, '*.csv')):
                 filename = os.path.split(filepath)[-1]
                 yield self.get_activity(filename)
-        else:
+        elif self.metadata is not None:
             for ride in self.metadata['RIDES'].keys():
                 yield self.get_activity(utils.date_string_to_filename(ride))
 
@@ -103,7 +106,10 @@ class LocalAthlete(BaseAthlete):
     def metadata(self):
         with open(os.path.join(settings.local_storage, settings.metadata_prefix,
                                f'{{{self.id}}}.json')) as f:
-            metadata = json.load(f)
+            try:
+                metadata = json.load(f)
+            except json.decoder.JSONDecodeError:
+                return
         return self.transform_metadata(metadata)
 
 
@@ -132,11 +138,14 @@ class RemoteAthlete(BaseAthlete):
         return ZipFile(self.download_object_as_bytes(self.metadata_key))
 
     def get_activity(self, activity_id):
-        date_string = utils.match_filename_to_date_strings(
-            filename=activity_id,
-            date_strings=self.metadata['RIDES'].keys()
-        )
-        metadata = self.metadata['RIDES'][date_string]
+        if self.metadata is not None:
+            date_string = utils.match_filename_to_date_strings(
+                filename=activity_id,
+                date_strings=self.metadata['RIDES'].keys()
+            )
+            metadata = self.metadata['RIDES'][date_string]
+        else:
+            metadata = None
 
         return Activity(activity_id, self.data_zip.open(activity_id), metadata)
 
@@ -160,7 +169,10 @@ class RemoteAthlete(BaseAthlete):
         for i in self.metadata_zip.filelist:
             if i.filename.endswith('.json'):
                 with self.metadata_zip.open(i.filename) as f:
-                    metadata = json.load(f)
+                    try:
+                        metadata = json.load(f)
+                    except json.decoder.JSONDecodeError:
+                        return
             break
         return self.transform_metadata(metadata)
 

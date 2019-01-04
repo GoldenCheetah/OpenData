@@ -110,6 +110,10 @@ class TestLocalAthlete:
         assert local_athlete.metadata['ATHLETE'] == 'some metadata'
         assert hasattr(local_athlete, '_lazy_metadata')
 
+    def test_metadata_invalid_json(self, local_storage_invalid_metadata, local_athlete):
+        assert not hasattr(local_athlete, '_lazy_metadata')
+        assert local_athlete.metadata is None
+
     @pytest.mark.aws_s3
     def test_download_remote_data(self):
         # TOTO: to be implemented
