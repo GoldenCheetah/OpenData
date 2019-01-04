@@ -88,6 +88,12 @@ class TestLocalAthlete:
         activity = local_athlete.get_activity('1970_01_01_00_00_00.csv')
         assert isinstance(activity, models.Activity)
 
+    def test_get_activity_missing_metadata(self, local_athlete):
+        local_athlete.metadata['RIDES'] = {}
+        activity = local_athlete.get_activity('1970_01_01_00_00_00.csv')
+        assert isinstance(activity, models.Activity)
+        assert activity.metadata is None
+
     def test_get_missing_activity(self, local_athlete):
         activity = local_athlete.get_activity('1900_01_01_00_00_00.csv')
         assert not activity.has_data()

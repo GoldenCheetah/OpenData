@@ -75,14 +75,15 @@ class LocalAthlete(BaseAthlete):
             self.id,
             activity_id)
 
-        date_string = utils.match_filename_to_date_strings(
-            filename=activity_id,
-            date_strings=self.metadata['RIDES'].keys()
-        )
+        metadata = None
         if self.metadata is not None:
-            metadata = self.metadata['RIDES'][date_string]
-        else:
-            metadata = None
+            date_string = utils.match_filename_to_date_strings(
+                filename=activity_id,
+                date_strings=self.metadata['RIDES'].keys()
+            )
+            if date_string is not None:
+                metadata = self.metadata['RIDES'][date_string]
+
         return Activity(activity_id, data_filepath, metadata)
 
     def activities_generator(self):
