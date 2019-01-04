@@ -3,7 +3,7 @@ import setuptools
 
 setuptools.setup(
     name="goldencheetah-opendata",
-    version='0.3.0',
+    version='0.3.1',
     author="Aart Goossens",
     author_email="aart@goossens.me  ",
     description="Python client library for the GoldenCheetah Open Data project",
