@@ -11,8 +11,12 @@ def date_string_to_filename(date_string):
     return suffix + '.csv'
 
 
+def filename_to_datetime(filename):
+    return datetime.strptime(filename, FILENAME_FORMAT_WITH_EXTENSION)
+
+
 def filename_to_date_string(filename):
-    dt = datetime.strptime(filename, FILENAME_FORMAT_WITH_EXTENSION)
+    dt = filename_to_datetime(filename)
     return dt.strftime(DATE_STRING_FORMAT) + 'UTC'
 
 
