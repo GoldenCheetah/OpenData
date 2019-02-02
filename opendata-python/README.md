@@ -23,7 +23,7 @@ od = OpenData()
 ```
 
 
-The library makes a clear distinction between working with remote data (AWS S3) and data that you have downloaded locally. Working with remote data makes it possible to work with data in e.g. an hosted Jupyter notebook or to play with data that you have not downloaded yet. Bare in mind that working with the remote data has a performance penalty: downloading the data is orders of magnitude slower that accessing data from disk. If you expect to use the data more often we advise you to store the data to disk (read on to see how to do that). As an added bonus you will save us some network traffic costs on our next AWS bill, yey!
+The library makes a clear distinction between working with remote data (AWS S3) and data that you have downloaded locally. Working with remote data makes it possible to work with data in e.g. a hosted Jupyter notebook or to play with data that you have not downloaded yet. Bear in mind that working with the remote data has a performance penalty: downloading the data is orders of magnitude slower that accessing data from disk. If you expect to use the data more often we advise you to store the data to disk (read on to see how to do that). As an added bonus you will save us some network traffic costs on our next AWS bill, yey!
 
 By default, when you store data locally the data is stored in an `opendatastorage` directory in your home directory (`~/opendatastorage`).
 In general:
@@ -39,13 +39,13 @@ local_storage_path = <path to your desired location>
 
 
 ### Working with remote data storage
-List all remote athletes.
+List all remote athletes:
 ```python
 for athlete in od.remote_athletes():
     # do something
     pass
 ```
-`od.remote_athletes()` returns a generator of `RemoteAthlete` models. It is important to note that this will only do a (i.e. 1) call to our remote storage to get a list of the available athletes without actually downloading the data. Only when you access the `metadata` attribute or call `athlete.activities()` or `athlete.get_activities()` the data will be downloaded.
+`od.remote_athletes()` returns a generator of `RemoteAthlete` models. It is important to note that this will only do a (i.e. 1) call to our remote storage to get a list of the available athletes without actually downloading the data. Only when you access the `metadata` attribute or call `athlete.activities()` or `athlete.get_activities()` will the data be downloaded.
 
 To get a specific athlete:
 ```python
