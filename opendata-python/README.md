@@ -111,7 +111,7 @@ activities = list(athlete.activities())
 
 This way you can access single activities by index:
 ```python
-activity = actitivies[99]
+activity = activities[99]
 ```
 
 To get a specific activity for an athlete by activity_id:
