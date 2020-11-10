@@ -28,5 +28,10 @@ settings.configure(
     data_prefix='data',
     metadata_prefix='metadata',
     datasets_prefix='datasets',
-    local_storage=config['Storage']['local_storage_path']
+    local_storage=config['Storage']['local_storage_path'],
+    db_host='localhost',
+    db_port='5432',
+    db_user='opendata',
+    db_password='password',
+    db_name='opendata',
 )
