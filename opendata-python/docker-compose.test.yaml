@@ -1,0 +1,12 @@
+version: '3.3'
+
+services:
+  postgres:
+    image: postgres
+    restart: always
+    ports:
+    - "5433:5432"
+    environment:
+      POSTGRES_USER: opendata
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: opendata

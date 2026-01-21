@@ -136,6 +136,9 @@ class TestRemoteAthlete:
     def test_get_activity(self, remote_athlete):
         activity = remote_athlete.get_activity('2016_01_05_17_49_23.csv')
         assert isinstance(activity, models.Activity)
+        print('++++++++++++++++++++')
+        print(activity.data.columns)
+        print('++++++++++++++++++++')
 
     def test_activities(self, remote_athlete):
         activities = remote_athlete.activities()

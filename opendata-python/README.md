@@ -166,3 +166,65 @@ activities[99].metadata
         ...
     }}
 ```
+
+### Connecting to a PostgreSQL database
+Although having all the Open Data files available as plain files on your computer has advantages (especially for less tech-savvy users), querying the data is slow and can be complicated.
+To overcome this, it is possible to store all the data in a [PostgreSQL](https://www.postgresql.org/) database as well.
+
+Setting up PostgreSQL (documentation [here](https://www.postgresql.org/docs/11/tutorial-install.html)) can be hassle, so there is a `docker-compose.yaml` included in this repository that *should* work out of the box by running `docker-compose up` in the directory where the file is stored.
+I am not going into the rabbit hole of explaining how to install docker and docker-compose here (a quick search will yield enough results for that). One comment: On MacOS and Linux installation is mostly painless, on Windows it not always is and I would advice against using docker there.
+As an alternative, you can use a local installation of PostgreSQL (assuming username=opendata, password=password, database name=opendata by default).
+
+When PostgreSQL is installed correctly and running, inserting data into the database is as easy as:
+```python
+from opendata import OpenData
+from opendata.db.main import OpenDataDB
+from opendata.models import LocalAthlete
+
+od = OpenData()
+opendatadb = OpenDataDB()
+opendatadb.create_tables()  # This is only needed once
+
+athlete = od.get_remote_athlete('0031326c-e796-4f35-8f25-d3937edca90f')
+
+opendatadb.insert_athlete(athlete)
+```
+Please note: This only inserts the athlete into the database, not the activities for this athlete.
+To add al the activities too:
+```python
+for activity in athlete.activities():
+    opendatadb.insert_activity(activity, athlete)
+```
+
+At this point there are 2 tables in the opendata database: "athletes" and "activities".
+The database schemas for both tables can be viewed [here](opendata/db/models.py).
+
+If you are familiar with raw SQL you can query the database directly, but if you prefer to stay in Python land, I got you covered too: Under the hood this library uses the [SQLAlchemy](https://www.sqlalchemy.org/) ORM.
+For some general documentation on how that works, see [here](https://docs.sqlalchemy.org/en/latest/orm/tutorial.html).
+Querying the data is possible using SQLAlchemy's query language (documentation [here](https://docs.sqlalchemy.org/en/latest/orm/query.html)).
+
+For example, to get a count of all activities that have power:
+```python
+from opendata.db import models
+from sqlalchemy.sql import not_
+
+session = opendatadb.get_session()
+session.query(models.Activities).filter(not_(models.Activities.power.all('nan'))).count()
+```
+
+Filters can be [chained](https://docs.sqlalchemy.org/en/latest/glossary.html#term-method-chaining) to apply multiple filters in one query:
+```python
+from datetime import datetime
+
+from opendata.db import models
+from sqlalchemy.sql import not_
+
+session = opendatadb.get_session()
+session.query(models.Activities).filter(Activities.datetime <= datetime(2017, 1, 1)).\
+    filter(not_(models.Activities.power.all('nan'))).count()
+```
+
+You can also query for nested keys/values in the metadata (stored in the "meta" column because SQLAlchemy uses the metadata column internally):
+```python
+session.query(models.Activity).filter(models.Activity.metrics.contains({'workout_time': '2703.00000'})).count()
+```
