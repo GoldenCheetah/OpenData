@@ -16,3 +16,6 @@ for use by amateurs, academics and professionals.
 * This repo provides tools for working with the data. There already is a Python library available, see [documentation](opendata-python/README.md) for more details.
 
 * An R library for working with GoldenCheetah OpenData has been published by Ioannis Kosmidis, see here: https://github.com/ikosmidis/GoldenCheetahOpenData
+
+Update: The server was taken offline since we had collected quite a lot of data at that point.
+We may put it back on line in the future, but there are no plans to do so at this point.
