@@ -14,6 +14,8 @@ setuptools.setup(
         "boto3",
         "pandas",
         "pkgsettings",
+        "psycopg2",
+        "sqlalchemy==1.2.5",
     ],
     tests_require=[
         "pytest",

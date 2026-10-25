@@ -5,6 +5,11 @@ from opendata.conf import settings
 import pytest
 
 
+pytest_modules = ['db']
+
+settings.db_port = '5433'
+
+
 def dummy_metadata(dir_name):
     metadata = {
         'ATHLETE': 'some metadata',
