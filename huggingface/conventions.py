@@ -173,12 +173,33 @@ WRITER_PROFILES = {
     "table": WriterProfile(compression_level=9, row_group_size=None),
 }
 
+# Encodings a column may declare in dataset.toml to override its profile's default. Encoding only
+# affects file size, never what readers get; some columns compress better with a dictionary
+# (few distinct values) than with byte-stream-split.
+ENCODINGS = {"byte_stream_split", "dictionary"}
+
+
+def default_encoding(profile: str, logical: str) -> str | None:
+    p = WRITER_PROFILES[profile]
+    if logical in p.byte_stream_split:
+        return "byte_stream_split"
+    if logical == "bool":
+        return None  # Parquet never dictionary-encodes booleans
+    if p.dictionary == "all" or logical == "string":
+        return "dictionary"
+    return None
+
+
 # Stored in every file's key-value metadata, so a single file says where it belongs.
 FILE_METADATA_KEY = b"goldencheetah"
 
 
-def write_table(table: Any, path: Path, profile: str, *, dataset: str, table_name: str) -> None:
-    """Write a pyarrow Table with the conventions' settings. The only supported way to write."""
+def write_table(table: Any, path: Path, profile: str, *, dataset: str, table_name: str,
+                encodings: dict[str, str] | None = None) -> None:
+    """Write a pyarrow Table with the conventions' settings. The only supported way to write.
+
+    `encodings` overrides the profile's default per column (see ENCODINGS); pass the encodings a
+    table declares in dataset.toml (`TableSpec.encodings`)."""
     import json
 
     import pyarrow.parquet as pq
@@ -190,11 +211,11 @@ def write_table(table: Any, path: Path, profile: str, *, dataset: str, table_nam
         {"dataset": dataset, "table": table_name, "conventions": VERSION}, sort_keys=True
     ).encode()
     table = table.replace_schema_metadata(meta)
-    kwargs: dict[str, Any] = {}
-    if p.byte_stream_split:
-        kwargs["column_encoding"] = {c: "BYTE_STREAM_SPLIT" for c, t in types.items() if t in p.byte_stream_split}
-    if p.dictionary == "strings":
-        kwargs["use_dictionary"] = [c for c, t in types.items() if t == "string"]
+    enc = {c: (encodings or {}).get(c) or default_encoding(profile, t) for c, t in types.items()}
+    kwargs: dict[str, Any] = {
+        "use_dictionary": [c for c, e in enc.items() if e == "dictionary"],
+        "column_encoding": {c: "BYTE_STREAM_SPLIT" for c, e in enc.items() if e == "byte_stream_split"},
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     pq.write_table(
@@ -219,6 +240,7 @@ class ColumnSpec:
     pattern: str | None = None
     grid: float | None = None   # time_s only: values k*grid, step exactly `grid` within an activity
     monotonic: bool = False     # time_s only: strictly increasing within an activity (implied by grid)
+    encoding: str | None = None # overrides the profile's default encoding (ENCODINGS)
 
 
 @dataclass
@@ -243,6 +265,11 @@ class TableSpec:
     @property
     def glob(self) -> str:
         return table_glob(self.name, self.partition_by)
+
+    @property
+    def encodings(self) -> dict[str, str]:
+        """Declared per-column encoding overrides, for write_table."""
+        return {c.name: c.encoding for c in self.columns if c.encoding}
 
 
 @dataclass
@@ -306,7 +333,8 @@ def load_dataset_spec(path: Path) -> DatasetSpec:
                 if "monotonic" in c and (name != "time_s" or not isinstance(monotonic, bool)):
                     errors.append(f"{where}.{name}: `monotonic` is true or false, on time_s only")
                 cols.append(ColumnSpec(name, s.type, s.unit, s.description, c.get("required", False),
-                                       True, s.pattern, grid, bool(monotonic) or grid is not None))
+                                       True, s.pattern, grid, bool(monotonic) or grid is not None,
+                                       c.get("encoding")))
             else:
                 if not re.match(NAME_RE, name):
                     errors.append(f"{where}.{name}: column names are lower snake_case")
@@ -318,7 +346,10 @@ def load_dataset_spec(path: Path) -> DatasetSpec:
                     if k in c:
                         errors.append(f"{where}.{name}: `{k}` applies to time_s only")
                 cols.append(ColumnSpec(name, c.get("type", "?"), c.get("unit"), c.get("description", ""),
-                                       c.get("required", False), False, c.get("pattern")))
+                                       c.get("required", False), False, c.get("pattern"),
+                                       encoding=c.get("encoding")))
+            if c.get("encoding") is not None and c["encoding"] not in ENCODINGS:
+                errors.append(f"{where}.{name}: encoding {c['encoding']!r} not one of {sorted(ENCODINGS)}")
         names = [c.name for c in cols]
         if len(set(names)) != len(names):
             errors.append(f"{where}: duplicate column names")

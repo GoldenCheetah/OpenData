@@ -91,6 +91,14 @@ and `tools/validate.py` checks a built dataset against both.
 - Time series use the `timeseries` profile: byte-stream-split encoding for floats, dictionary
   encoding for ids, zstd level 15, 256k-row (~2 MB) row groups. The measurements behind these
   choices are in `research/reports/05`, `06`, `09` and `10`.
+- Encoding only affects size, never what readers get. A column that compresses better another way
+  (say, a derived float with few distinct values, which suits a dictionary) declares
+  `encoding = "dictionary"` in `dataset.toml`; `write_table` applies it and the validator checks it.
+  Otherwise only the time series default (byte-stream-split floats) is enforced.
+- Checked by the validator: zstd, page index (offset index always; column index wherever there
+  are min/max statistics), row-group size, the time series float encoding, declared encodings and
+  the file metadata. Compression level and content-defined chunking can't be read back from a
+  file; `write_table` sets them.
 
 ## Versioning
 
