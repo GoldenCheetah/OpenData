@@ -1,0 +1,112 @@
+# GoldenCheetah OpenData: the full OSF release (osf.io/6hfpz) as Parquet, lossless.
+#
+# What this dataset contains, in terms of the shared conventions (../../conventions.py,
+# ../../CONVENTIONS.md). Shared columns are listed by name only; their type, unit and meaning come
+# from the conventions. Columns are listed in file order. tools/validate.py checks a built dataset
+# against this file, and the dataset card's subsets and data dictionary are generated from it.
+
+[dataset]
+name = "opendata"
+repo_id = "GoldenCheetah/opendata"
+pretty_name = "GoldenCheetah OpenData"
+license = "cc0-1.0"
+conventions = "0.1"
+
+# --- athletes ------------------------------------------------------------------------
+[tables.athletes]
+description = "One row per athlete (one per OSF zip), including athletes without activities."
+key = ["athlete_id"]
+columns = [
+    { name = "athlete_id" },
+    { name = "gender" },
+    { name = "yob" },
+    { name = "json_athlete_id", type = "string", description = "Athlete id inside the athlete's JSON. Differs from `athlete_id` in rare re-uploads, which makes such duplicates visible." },
+    { name = "gc_json_version", type = "string", description = "Version of GoldenCheetah's OpenData JSON format (`1.8`, `1.9`, `2.0`)." },
+    { name = "n_activities", type = "int64", required = true, description = "Number of rows in `activities` for this athlete." },
+    { name = "n_timeseries", type = "int64", required = true, description = "Number of activities with a time series." },
+    { name = "osf_file_id", type = "string", required = true, description = "OSF file id of the source zip." },
+    { name = "osf_sha256", type = "string", required = true, pattern = "^[0-9a-f]{64}$", description = "SHA-256 of the source zip on OSF: provenance back to the exact file." },
+    { name = "osf_size_bytes", type = "int64", unit = "bytes", required = true, description = "Size of the source zip." },
+    { name = "osf_date_created", type = "timestamp[us, tz=UTC]", description = "When the source zip was uploaded to OSF." },
+]
+
+# --- activities ----------------------------------------------------------------------
+[tables.activities]
+description = "One row per activity: start time, sport, data flags and GoldenCheetah's metrics."
+default = true
+key = ["athlete_id", "activity_id"]
+columns = [
+    { name = "athlete_id" },
+    { name = "activity_id" },
+    { name = "start_time_utc" },
+    { name = "utc_offset_minutes" },
+    { name = "sport" },
+    { name = "data_flags", type = "string", description = "GoldenCheetah's 15-character data availability string (`T`ime, `D`istance, `S`peed, `P`ower, `H`eart rate, `C`adence, ...)." },
+    { name = "xdata", type = "string", description = "GoldenCheetah's XDATA entry (extra data series) as a JSON string, or null." },
+    { name = "has_timeseries", type = "bool", required = true, description = "Whether `timeseries` has samples for this activity. False for manual entries and other activities without a CSV." },
+]
+
+[tables.activities.extra_columns]
+types = ["float64", "list<float64>"]
+verbatim_names = true
+description = "GoldenCheetah metrics, one column per metric, names as GoldenCheetah writes them (quote them in SQL: `\"10m_critical_power\"`). Metrics given as `[value, weight]` pairs are split into `<metric>` and `<metric>__weight`; array metrics (`power_mmp`, `*_dist`, `*_dist_bins`, ...) are lists."
+
+# --- timeseries ----------------------------------------------------------------------
+[tables.timeseries]
+description = "One row per sample, as recorded: mostly 1 Hz, gaps not filled. Exact: every value equals the original CSV value (see the card)."
+profile = "timeseries"
+partition_by = "athlete_id"
+key = []  # samples have no key of their own; (athlete_id, activity_id, row order) identifies them
+columns = [
+    { name = "athlete_id", required = true },
+    { name = "activity_id", required = true },
+    { name = "time_s" },
+    { name = "distance_m" },
+    { name = "power_w" },
+    { name = "hr_bpm" },
+    { name = "cadence_rpm" },
+    { name = "altitude_m" },
+]
+
+# --- timeseries_exceptions -----------------------------------------------------------
+[tables.timeseries_exceptions]
+description = "The few source values that Float32 cannot hold (sub-normal junk such as 4.94066e-324), which appear as 0 in `timeseries`, with their exact original value."
+key = ["athlete_id", "activity_id", "row_in_activity", "column"]
+columns = [
+    { name = "athlete_id" },
+    { name = "activity_id" },
+    { name = "row_in_activity", type = "int32", description = "0-based row of the sample within its activity in `timeseries`." },
+    { name = "column", type = "string", description = "Column in `timeseries` (`power_w`, ...)." },
+    { name = "source_column", type = "string", required = true, description = "Column in the original CSV (`power`, ...)." },
+    { name = "source_value", type = "float64", required = true, description = "The original value, exactly." },
+]
+
+# --- raw_json ------------------------------------------------------------------------
+[tables.raw_json]
+description = "Each athlete's original JSON file, verbatim, so nothing in it is lost even where `activities` and `athletes` normalise it."
+key = ["athlete_id"]
+columns = [
+    { name = "athlete_id" },
+    { name = "json", type = "string", required = true, description = "The original `{athlete_id}.json` text." },
+]
+
+# --- relations -----------------------------------------------------------------------
+[[relations]]
+table = "activities"
+references = "athletes"
+on = ["athlete_id"]
+
+[[relations]]
+table = "timeseries"
+references = "activities"
+on = ["athlete_id", "activity_id"]
+
+[[relations]]
+table = "timeseries_exceptions"
+references = "activities"
+on = ["athlete_id", "activity_id"]
+
+[[relations]]
+table = "raw_json"
+references = "athletes"
+on = ["athlete_id"]
