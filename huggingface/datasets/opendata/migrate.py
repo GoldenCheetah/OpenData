@@ -570,9 +570,17 @@ def _low_priority() -> None:
         pass
 
 
-def metadata_forms_worker(athlete_id: str, workdir: str) -> dict[str, list[str]]:
-    with gcod.open_athlete_zip(Build(Path(workdir)).zip_path(athlete_id)) as az:
-        return {k: sorted(v) for k, v in gcod.metric_forms(az.meta or {}).items()}
+def metadata_forms_worker(athlete_id: str, workdir: str, samples: dict[str, int]) -> tuple[dict, str | None]:
+    """(metric forms, error). Also builds the athlete's activities once with its own metrics, so
+    that problems in the JSON surface here, before anything is written."""
+    _low_priority()
+    try:
+        with gcod.open_athlete_zip(Build(Path(workdir)).zip_path(athlete_id)) as az:
+            forms = gcod.metric_forms(az.meta or {})
+            gcod.build_activities(az, gcod.metric_kinds(forms), samples)
+            return {k: sorted(v) for k, v in forms.items()}, None
+    except gcod.GcodError as e:
+        return {}, str(e)
 
 
 def metadata_worker(athlete_id: str, workdir: str, kinds: dict[str, str], samples: dict[str, int]):
@@ -653,6 +661,18 @@ def stage_convert(workdir: Path, jobs: int, athletes: list[str] | None, athletes
                 log(f"timeseries: {i:,}/{len(todo):,} athletes, {el / i:.1f} s/athlete, "
                     f"ETA {human_duration(el / i * (len(todo) - i))}")
     errors = {a: manifest[a]["error"] for a in ids if manifest[a]["status"] != "ok"}
+
+    # 2. metric schema over all athletes, and a dry run of their metadata (before anything is written)
+    log("metadata: collecting the metric schema and checking every JSON ...")
+    forms: dict[str, set[str]] = {}
+    candidates = [a for a in ids if a not in errors]
+    with ProcessPoolExecutor(jobs) as ex:
+        for a, (fm, err) in zip(candidates, ex.map(metadata_forms_worker, candidates, [str(workdir)] * len(candidates),
+                                                   [manifest[a].get("samples", {}) for a in candidates], chunksize=8)):
+            if err:
+                errors[a] = err
+            for k, v in fm.items():
+                forms.setdefault(k, set()).update(v)
     if errors:
         log(f"{len(errors)} athletes could not be converted:")
         for a, e in sorted(errors.items()):
@@ -661,30 +681,40 @@ def stage_convert(workdir: Path, jobs: int, athletes: list[str] | None, athletes
             log("not writing the other tables; fix the converter or pass --allow-errors to leave these athletes out")
             return 1
     ok_ids = [a for a in ids if a not in errors]
-    # time series files of athletes no longer selected must not linger in the output
+    if errors:  # the metric schema must come from the athletes that are kept
+        forms = {}
+        with ProcessPoolExecutor(jobs) as ex:
+            for fm, _ in ex.map(metadata_forms_worker, ok_ids, [str(workdir)] * len(ok_ids),
+                                [manifest[a].get("samples", {}) for a in ok_ids], chunksize=8):
+                for k, v in fm.items():
+                    forms.setdefault(k, set()).update(v)
+    # time series files of athletes not in this dataset must not linger in the output
     for d in (b.repo / "data" / "timeseries").glob("athlete_id=*"):
         if d.name.split("=", 1)[1] not in set(ok_ids):
             shutil.rmtree(d)
-
-    # 2. metric schema over all selected athletes
-    log("metadata: collecting the metric schema ...")
-    forms: dict[str, set[str]] = {}
-    with ProcessPoolExecutor(jobs) as ex:
-        for fm in ex.map(metadata_forms_worker, ok_ids, [str(workdir)] * len(ok_ids), chunksize=16):
-            for k, v in fm.items():
-                forms.setdefault(k, set()).update(v)
     kinds = gcod.metric_kinds(forms)
     log(f"metadata: {len(kinds)} metrics ({sum(k == 'scalar' for k in kinds.values())} scalar, "
         f"{sum(k == 'pair' for k in kinds.values())} value+weight, {sum(k == 'list' for k in kinds.values())} list)")
 
-    # 3. activities, athletes, raw_json (in athlete order; batched to bound memory)
-    import pyarrow as pa
-
+    # 3. activities, athletes, raw_json, exceptions (in athlete order, streamed), then the card
     tmp = {t: b.repo / "data" / f"{t}.tmp" for t in ("activities", "athletes", "raw_json", "timeseries_exceptions")}
     for d in tmp.values():
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
+    try:
+        return _write_metadata_tables(b, sel, ok_ids, kinds, manifest, tmp, jobs, errors)
+    finally:
+        for d in tmp.values():  # left over only if writing failed or was stopped
+            if d.exists():
+                shutil.rmtree(d)
+
+
+def _write_metadata_tables(b: Build, sel: pl.DataFrame, ok_ids: list[str], kinds: dict[str, str],
+                           manifest: dict[str, dict], tmp: dict[str, Path], jobs: int, errors: dict[str, str]) -> int:
+    import pyarrow as pa
+
+    workdir = b.workdir
     json_buf: list[dict] = []
     json_bytes = json_part = 0
     athlete_rows: list[dict] = []

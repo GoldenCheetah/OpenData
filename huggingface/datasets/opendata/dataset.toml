@@ -10,7 +10,7 @@ name = "opendata"
 repo_id = "GoldenCheetah/opendata"
 pretty_name = "GoldenCheetah OpenData"
 license = "cc0-1.0"
-conventions = "0.1"
+conventions = "0.2"
 
 # --- athletes ------------------------------------------------------------------------
 [tables.athletes]
@@ -22,6 +22,7 @@ columns = [
     { name = "yob" },
     { name = "json_athlete_id", type = "string", description = "Athlete id inside the athlete's JSON. Differs from `athlete_id` in rare re-uploads, which makes such duplicates visible." },
     { name = "gc_json_version", type = "string", description = "Version of GoldenCheetah's OpenData JSON format (`1.8`, `1.9`, `2.0`)." },
+    { name = "json_repaired", type = "bool", required = true, description = "The athlete's JSON had unescaped double quotes in a free-text value (a GoldenCheetah export bug) and was repaired to be read. `raw_json` has the original text." },
     { name = "n_activities", type = "int64", required = true, description = "Number of rows in `activities` for this athlete." },
     { name = "n_timeseries", type = "int64", required = true, description = "Number of activities with a time series." },
     { name = "osf_file_id", type = "string", required = true, description = "OSF file id of the source zip." },

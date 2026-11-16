@@ -116,3 +116,16 @@ def test_a_failed_write_leaves_no_file(tmp_path: Path):
             w.write(t)
             raise RuntimeError
     assert list(tmp_path.iterdir()) == []
+
+
+def test_a_json_problem_is_reported_before_anything_is_written(tmp_path: Path, zips: Path):
+    workdir = tmp_path / "work"
+    dup = make_zip(zips / f"{A2}.zip", [ride("2019/03/02 07:00:00 UTC", metrics={"total_work": "1"}),
+                                        ride("2019/03/02 07:00:00 UTC", metrics={"total_work": "2"})], {})
+    write_workdir(workdir, [basic_athlete(zips, A1), dup])
+    assert migrate.stage_convert(workdir, jobs=1, athletes=None, athletes_from=None, allow_errors=False) == 1
+    data = workdir / "build" / "opendata" / "data"
+    assert not (data / "activities").exists() and not list(data.glob("*.tmp"))
+    assert migrate.stage_convert(workdir, jobs=1, athletes=None, athletes_from=None, allow_errors=True) == 0
+    assert pl.read_parquet(data / "athletes" / "*.parquet")["athlete_id"].to_list() == [A1]
+    assert not list(data.glob("*.tmp"))

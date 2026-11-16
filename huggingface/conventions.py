@@ -31,7 +31,7 @@ from typing import Any
 
 # Version of these rules. Every dataset.toml names the version it follows; the validator applies
 # that version's rules. 0.x while nothing is published; 1.0 with the first public release.
-VERSION = "0.1"
+VERSION = "0.2"
 
 ROOT = Path(__file__).resolve().parent
 
@@ -85,9 +85,10 @@ class Column:
 
 
 ATHLETE_ID_RE = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-# Local start time from the activity's CSV name (rarely with a `.fit` suffix, which GoldenCheetah
-# also wrote), or, for activities that have no CSV, the UTC start time followed by `Z`.
-ACTIVITY_ID_RE = r"^\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}(\.fit|Z)?$"
+# Local start time from the activity's CSV name, sometimes followed by the original file's
+# extension(s) that GoldenCheetah kept (`.fit`, `.pwx`, `.csv.bak`, ...); or, for activities that
+# have no CSV, the UTC start time followed by `Z`.
+ACTIVITY_ID_RE = r"^\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}(Z|(\.[A-Za-z0-9]+)*)$"
 
 # A name in this registry means the same thing, with the same type and unit, in every dataset.
 # A dataset may leave a shared column out, but if it has a column with this name, it is this one.
@@ -98,8 +99,9 @@ SHARED_COLUMNS: dict[str, Column] = {c.name: c for c in [
            "athlete's zip on OSF. Identical across datasets.", ATHLETE_ID_RE),
     Column("activity_id", "string", None,
            "Activity id, unique within an athlete: the local start time `YYYY_MM_DD_HH_MM_SS` from "
-           "the original CSV name (a few end in `.fit`, as GoldenCheetah wrote them). Activities "
-           "without a CSV use their UTC start time followed by `Z`. Identical across datasets.",
+           "the original CSV name, in a few cases followed by the original file's extension "
+           "(`.fit`, `.pwx`, `.csv.bak`, ...). Activities without a CSV use their UTC start time "
+           "followed by `Z`. Identical across datasets.",
            ACTIVITY_ID_RE),
     # time series
     Column("time_s", "float32", "s",

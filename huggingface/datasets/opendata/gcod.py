@@ -24,12 +24,14 @@ from typing import Any, Iterator
 import polars as pl
 
 # Bump when the output for the same input changes; migrate.py then rebuilds affected files.
-CONVERTER_VERSION = "0.2.0"
+CONVERTER_VERSION = "0.3.0"
 
 ATHLETE_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-# Activity CSV member names: YYYY_MM_DD_HH_MM_SS.csv, and in a few zips YYYY_..._SS.fit (a CSV
-# despite the name) or YYYY_..._SS.fit.csv. The local start time is the name.
-ACTIVITY_MEMBER_RE = re.compile(r"^(\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2})(\.fit)?(\.csv)?$")
+# Activity CSV member names: the local start time YYYY_MM_DD_HH_MM_SS, usually + `.csv`. GoldenCheetah
+# sometimes kept the original file's extension: `.fit`, `.fit.csv`, `.pwx`, `.csv.bak.csv` (a backup
+# version next to the `.csv`), ... These are CSVs all the same (the header is checked) and are kept
+# as separate activities; their activity_id is the name without a final `.csv`.
+ACTIVITY_MEMBER_RE = re.compile(r"^(\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2})((?:\.[A-Za-z0-9]+)*)$")
 
 # CSV column -> output column; km -> m. Order is the order in timeseries.
 CSV_HEADER = ["secs", "km", "power", "hr", "cad", "alt"]
@@ -58,9 +60,10 @@ class GcodError(Exception):
 @dataclass
 class AthleteZip:
     athlete_id: str
-    json_text: str | None
-    meta: dict | None
-    activity_members: list[str]   # CSV members, sorted by name
+    json_text: str
+    meta: dict
+    json_repaired: bool            # the JSON needed parse_gc_json's repair
+    activity_members: list[str]   # CSV members, sorted by activity_id
     _zf: zipfile.ZipFile
 
     def read(self, member: str) -> bytes:
@@ -83,9 +86,19 @@ def open_athlete_zip(path: Path) -> AthleteZip:
         raise GcodError(f"zip name {path.name!r} is not an athlete UUID")
     zf = zipfile.ZipFile(path)
     jsons, activities, other = [], [], []
+    seen: dict[str, zipfile.ZipInfo] = {}
     for info in zf.infolist():
         if info.is_dir():
             continue
+        # Some zips hold the same member twice. Byte-identical copies are one member; copies that
+        # differ can't be told apart by name, so that fails loudly.
+        if (first := seen.get(info.filename)) is not None:
+            if (first.CRC, first.file_size) == (info.CRC, info.file_size) and \
+                    zf.open(first).read() == zf.open(info).read():
+                continue
+            zf.close()
+            raise GcodError(f"member {info.filename} occurs twice with different content")
+        seen[info.filename] = info
         base = info.filename.rsplit("/", 1)[-1]
         if base.endswith(".json"):
             jsons.append(info.filename)
@@ -99,19 +112,43 @@ def open_athlete_zip(path: Path) -> AthleteZip:
     if len(jsons) > 1:
         zf.close()
         raise GcodError(f"more than one JSON: {jsons[:5]}")
-    json_text = meta = None
-    if jsons:
-        raw = zf.read(jsons[0])
-        try:
-            json_text = raw.decode("utf-8")
-            meta = json.loads(json_text)
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            zf.close()
-            raise GcodError(f"invalid JSON {jsons[0]}: {e}") from e
-    else:
+    if not jsons:
         zf.close()
         raise GcodError("no JSON in zip")
-    return AthleteZip(athlete_id, json_text, meta, sorted(activities, key=activity_id), zf)
+    try:
+        json_text = zf.read(jsons[0]).decode("utf-8")
+    except UnicodeDecodeError as e:
+        zf.close()
+        raise GcodError(f"JSON {jsons[0]} is not UTF-8: {e}") from e
+    try:
+        meta, repaired = parse_gc_json(json_text)
+    except GcodError as e:
+        zf.close()
+        raise GcodError(f"invalid JSON {jsons[0]}: {e}") from e
+    return AthleteZip(athlete_id, json_text, meta, repaired, sorted(activities, key=activity_id), zf)
+
+
+# GoldenCheetah writes one `"key":"value"` per line and did not escape double quotes inside free-text
+# values (e.g. `"sport":"... "Spring is coming!""`). Only this known bug is repaired; the original
+# text is kept unchanged (raw_json), and athletes.json_repaired records that it happened.
+_STRING_LINE = re.compile(r'^(\s*"[^"\\]+"\s*:\s*")(.*)("\s*,?\s*)$')
+
+
+def parse_gc_json(text: str) -> tuple[dict, bool]:
+    """(parsed JSON, whether it needed the unescaped-quotes repair)."""
+    try:
+        return json.loads(text), False
+    except json.JSONDecodeError as first:
+        lines = []
+        for line in text.split("\n"):
+            m = _STRING_LINE.match(line)
+            if m and re.search(r'(?<!\\)"', m.group(2)):
+                line = m.group(1) + re.sub(r'(?<!\\)"', r'\\"', m.group(2)) + m.group(3)
+            lines.append(line)
+        try:
+            return json.loads("\n".join(lines)), True
+        except json.JSONDecodeError:
+            raise GcodError(str(first)) from first
 
 
 def activity_id(member: str) -> str:
@@ -319,7 +356,7 @@ def build_activities(az: AthleteZip, kinds: dict[str, str], samples: dict[str, i
     has_timeseries means at least one row.
     """
     meta = az.meta or {}
-    rides = meta.get("RIDES", [])
+    rides = unique_rides(meta.get("RIDES", []))
     csv_ids = [activity_id(m) for m in az.activity_members]
     utc = [parse_utc(r.get("date", "")) for r in rides]
     links = match_rides(utc, csv_ids)
@@ -364,6 +401,22 @@ def build_activities(az: AthleteZip, kinds: dict[str, str], samples: dict[str, i
     return df.sort("start_time_utc", "activity_id", nulls_last=True)
 
 
+def unique_rides(rides: list[dict]) -> list[dict]:
+    """Rides without byte-for-byte duplicates (some JSONs list a ride twice). Two different rides
+    with the same start time can't both be kept under one key: that fails loudly."""
+    out, by_date = [], {}
+    for r in rides:
+        key = json.dumps(r, sort_keys=True)
+        date = r.get("date")
+        if date in by_date:
+            if by_date[date] == key:
+                continue
+            raise GcodError(f"two different rides start at {date}")
+        by_date[date] = key
+        out.append(r)
+    return out
+
+
 def athlete_row(az: AthleteZip, n_activities: int, n_timeseries: int) -> dict:
     ath = (az.meta or {}).get("ATHLETE", {})
     yob = str(ath.get("yob", ""))
@@ -373,6 +426,7 @@ def athlete_row(az: AthleteZip, n_activities: int, n_timeseries: int) -> dict:
         "yob": int(yob) if yob.isdigit() else None,
         "json_athlete_id": (ath.get("id") or "").strip("{}") or None,
         "gc_json_version": (az.meta or {}).get("VERSION"),
+        "json_repaired": az.json_repaired,
         "n_activities": n_activities,
         "n_timeseries": n_timeseries,
     }

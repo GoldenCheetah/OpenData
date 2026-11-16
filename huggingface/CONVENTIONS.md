@@ -31,8 +31,9 @@ and `tools/validate.py` checks a built dataset against both.
 - `athlete_id`: the UUID of the athlete in the original OpenData release (the name of their zip on
   OSF). Every dataset derived from it uses the same id.
 - `activity_id`: unique within an athlete. It is the local start time from the original CSV name,
-  `YYYY_MM_DD_HH_MM_SS`; a few CSVs carry a `.fit` suffix, which is kept because the release has
-  activities whose only difference is that suffix. Activities without a CSV (manual entries, days
+  `YYYY_MM_DD_HH_MM_SS`. A few CSVs carry the original file's extension (`.fit`, `.pwx`,
+  `.csv.bak`, ...), which is kept: the release has activities whose only difference is that
+  suffix, such as a backup version next to the regular one. Activities without a CSV (manual entries, days
   off, ...) use their UTC start time followed by `Z`: `2017_01_31_17_36_44Z`. The `Z` keeps these
   ids apart from CSV-based ids and says that the time is UTC, not local.
 - Tables with a key declare it; the validator checks that keys are unique and complete.
@@ -120,12 +121,12 @@ and `tools/validate.py` checks a built dataset against both.
 
 <!-- BEGIN GENERATED: conventions.py -->
 
-Conventions version **0.1**.
+Conventions version **0.2**.
 
 | column | type | unit | meaning |
 |---|---|---|---|
 | `athlete_id` | `string` |  | Anonymous athlete id (UUID) from the GoldenCheetah OpenData release; the name of the athlete's zip on OSF. Identical across datasets. |
-| `activity_id` | `string` |  | Activity id, unique within an athlete: the local start time `YYYY_MM_DD_HH_MM_SS` from the original CSV name (a few end in `.fit`, as GoldenCheetah wrote them). Activities without a CSV use their UTC start time followed by `Z`. Identical across datasets. |
+| `activity_id` | `string` |  | Activity id, unique within an athlete: the local start time `YYYY_MM_DD_HH_MM_SS` from the original CSV name, in a few cases followed by the original file's extension (`.fit`, `.pwx`, `.csv.bak`, ...). Activities without a CSV use their UTC start time followed by `Z`. Identical across datasets. |
 | `time_s` | `float32` | s | Seconds since the start of the activity, as stored in this dataset. Fractional for devices that record at other intervals (e.g. 0.5 s, 1.26 s). A dataset that trims or resamples activities says so in its card; its `time_s` then need not match the raw data. |
 | `distance_m` | `float32` | m | Cumulative distance since the start of the activity. |
 | `power_w` | `float32` | W | Power. |
