@@ -53,7 +53,7 @@ import polars as pl
 
 # one athlete = one file: timeseries/athlete_id=<uuid>/part.parquet
 ts = pl.read_parquet("hf://datasets/{{repo_id}}/data/timeseries/"
-                     "athlete_id=9bdd724b-4148-4bee-9344-9e7a526c7fc1/part.parquet")
+                     "athlete_id={{example_athlete_id}}/part.parquet")
 
 # many athletes: scan the folder and select only the columns you need
 power = (pl.scan_parquet("hf://datasets/{{repo_id}}/data/timeseries/*/*.parquet")

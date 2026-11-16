@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["httpx>=0.27", "polars>=1.20", "pyarrow>=21", "pyyaml>=6"]
+# dependencies = ["httpx>=0.27", "huggingface_hub>=2.4", "polars>=1.20", "pyarrow>=21", "pyyaml>=6"]
 # ///
 """GoldenCheetah OpenData (GCOD): migrate the OSF release to Hugging Face.
 
@@ -10,7 +10,9 @@ Every stage is resumable and safe to re-run; the files in the work directory are
   mirror    download every athlete zip and verify its sha256 -> <workdir>/osf/athletes/<uuid>.zip
   convert   zips -> the dataset folder to upload              -> <workdir>/build/opendata/
   check     validate it, and compare every time series value with the original CSVs
-  (upload: to follow)
+                                                             -> <workdir>/build/check.json
+  upload    upload exactly the checked dataset folder to a Hugging Face dataset repo, and
+            verify every file on the Hub against it         -> <workdir>/build/uploads.jsonl
 
 Usage (from huggingface/):
 
@@ -18,6 +20,12 @@ Usage (from huggingface/):
   uv run datasets/opendata/migrate.py mirror [--workers 3]
   uv run datasets/opendata/migrate.py convert [--jobs N] [--athletes UUID ... | --athletes-from FILE]
   uv run datasets/opendata/migrate.py check [--jobs N] [--text-fraction 0.05]
+  uv run datasets/opendata/migrate.py upload --repo GoldenCheetah/opendata-test
+
+`upload` needs `hf auth login` (write access to the repo), refuses unless `check` passed on the
+dataset folder as it is now, and creates the repo as private if it doesn't exist. The repo then
+holds exactly the dataset folder: remote files that aren't in it are deleted. Interrupted uploads
+resume when run again.
 
 `convert` converts an athlete again only when its zip or the converter version changed. It stops
 before writing the metadata tables if any athlete can't be converted (unknown quirks fail loudly);
@@ -486,6 +494,14 @@ class Build:
     def manifest(self) -> Path:
         return self.root / "manifest.jsonl"
 
+    @property
+    def check_record(self) -> Path:
+        return self.root / "check.json"
+
+    @property
+    def uploads(self) -> Path:
+        return self.root / "uploads.jsonl"
+
     def zip_path(self, athlete_id: str) -> Path:
         return self.workdir / "osf" / "athletes" / f"{athlete_id}.zip"
 
@@ -790,7 +806,10 @@ def _write_metadata_tables(b: Build, sel: pl.DataFrame, ok_ids: list[str], kinds
 
     # 4. dataset card
     n_rows = sum(manifest[a]["rows"] for a in ok_ids)
-    write_card(b.repo, n_athletes=len(ok_ids), n_activities=int(athletes_df["n_activities"].sum()), n_rows=n_rows)
+    # the card's example athlete: one that is in this build, with the most time series
+    example = athletes_df.sort(["n_timeseries", "athlete_id"], descending=[True, False])["athlete_id"][0]
+    write_card(b.repo, n_athletes=len(ok_ids), n_activities=int(athletes_df["n_activities"].sum()), n_rows=n_rows,
+               example_athlete_id=example)
     log(f"convert: done. {len(ok_ids):,} athletes, {athletes_df['n_activities'].sum():,} activities, "
         f"{n_rows:,} samples, {exc.height:,} exception values -> {b.repo}")
     if errors:
@@ -798,11 +817,12 @@ def _write_metadata_tables(b: Build, sel: pl.DataFrame, ok_ids: list[str], kinds
     return 0
 
 
-def write_card(repo: Path, n_athletes: int, n_activities: int, n_rows: int) -> None:
+def write_card(repo: Path, n_athletes: int, n_activities: int, n_rows: int, example_athlete_id: str) -> None:
     text = CARD_TEMPLATE.read_text()
     values = {
         "configs": C.card_configs(SPEC),
         "repo_id": SPEC.repo_id,
+        "example_athlete_id": example_athlete_id,
         "n_athletes": f"{n_athletes:,}",
         "n_activities": f"{n_activities:,}",
         "n_rows": f"{n_rows / 1e9:.1f} billion" if n_rows >= 1e9 else f"{n_rows / 1e6:.0f} million",
@@ -925,8 +945,141 @@ def stage_check(workdir: Path, jobs: int, text_fraction: float, seed: int) -> in
     log(f"check: {total:,} values in {len(ids):,} athletes compared, {differ:,} differ; "
         f"{len(problems)} athletes with problems; has_timeseries mismatches: {mismatch}")
     ok = status == 0 and not problems and mismatch == 0
+    b.check_record.unlink(missing_ok=True)
+    if ok:  # what passed, file by file: `upload` uploads exactly this
+        files = folder_files(b.repo, with_sha256=True, jobs=jobs)
+        record = {"result": "pass", "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                  "converter": gcod.CONVERTER_VERSION, "conventions": C.VERSION, "values_compared": total,
+                  "files": files}
+        tmp = b.check_record.with_suffix(".tmp")
+        tmp.write_text(json.dumps(record, indent=1) + "\n")
+        tmp.replace(b.check_record)
     log("check: PASS" if ok else "check: FAIL")
     return 0 if ok else 1
+
+
+def folder_files(root: Path, with_sha256: bool = False, jobs: int = 4) -> dict[str, dict]:
+    """Every file under root (relative POSIX path) with its size and mtime, and optionally sha256."""
+    paths = sorted(p for p in root.rglob("*") if p.is_file())
+    out = {p.relative_to(root).as_posix(): {"size": (st := p.stat()).st_size, "mtime_ns": st.st_mtime_ns}
+           for p in paths}
+    if with_sha256:
+        with ThreadPoolExecutor(jobs) as ex:  # hashlib releases the GIL
+            for rel, digest in zip(out, ex.map(sha256_file, paths)):
+                out[rel]["sha256"] = digest
+    return out
+
+
+# --- upload --------------------------------------------------------------------------
+def checked_files(b: Build) -> dict[str, dict]:
+    """The files `check` passed, provided the dataset folder still is exactly that; else stop."""
+    if not b.check_record.exists():
+        raise SystemExit("upload: no passing check of this build; run `check` first")
+    rec = json.loads(b.check_record.read_text())
+    if rec.get("converter") != gcod.CONVERTER_VERSION:
+        raise SystemExit(f"upload: the check was of converter {rec.get('converter')}, this is "
+                         f"{gcod.CONVERTER_VERSION}; run `convert` and `check` again")
+    now = folder_files(b.repo)
+    was = {k: {"size": v["size"], "mtime_ns": v["mtime_ns"]} for k, v in rec["files"].items()}
+    if now != was:
+        changed = sorted(k for k in now.keys() | was.keys() if now.get(k) != was.get(k))
+        raise SystemExit(f"upload: the dataset folder changed since it was checked ({len(changed)} files, "
+                         f"e.g. {', '.join(changed[:3])}); run `check` again")
+    return rec["files"]
+
+
+REPO_ID_RE = r"^[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*$"
+
+
+def card_for(card: str, repo_id: str) -> str:
+    """The card with its code examples pointing at repo_id instead of the dataset's own repo."""
+    return re.sub(rf"(?<![\w.-]){re.escape(SPEC.repo_id)}(?![\w.-])", repo_id, card)
+
+
+def stage_upload_folder(b: Build, files: dict[str, dict], repo_id: str) -> Path:
+    """A copy of the dataset folder (hard links, so free) with the card made for repo_id."""
+    folder = b.root / "upload" / repo_id.replace("/", "__")
+    if folder.exists():
+        shutil.rmtree(folder)
+    for rel in files:
+        dst = folder / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if rel == "README.md":
+            dst.write_text(card_for((b.repo / rel).read_text(), repo_id))
+        else:
+            try:
+                os.link(b.repo / rel, dst)
+            except OSError:
+                shutil.copy2(b.repo / rel, dst)
+    return folder
+
+
+def git_blob_sha1(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def remote_differences(expected: dict[str, dict], remote: list) -> list[str]:
+    """Compare files on the Hub (RepoFile-like: path, size, blob_id, lfs) with the expected ones
+    (path -> size, sha256 and, for small files kept in git, git_sha1)."""
+    out = []
+    seen = {}
+    for f in remote:
+        if f.path == ".gitattributes" or not hasattr(f, "blob_id"):  # skip folders
+            continue
+        seen[f.path] = f
+        e = expected.get(f.path)
+        if e is None:
+            out.append(f"{f.path}: on the Hub but not in the dataset folder")
+        elif f.size != e["size"]:
+            out.append(f"{f.path}: {f.size:,} bytes on the Hub, {e['size']:,} here")
+        elif f.lfs is not None and f.lfs.sha256 != e["sha256"]:
+            out.append(f"{f.path}: sha256 differs")
+        elif f.lfs is None and f.blob_id != e.get("git_sha1"):
+            out.append(f"{f.path}: git blob differs")
+    out += [f"{p}: missing on the Hub" for p in sorted(expected.keys() - seen.keys())]
+    return out
+
+
+def stage_upload(workdir: Path, repo_id: str) -> int:
+    from huggingface_hub import HfApi
+
+    if not re.match(REPO_ID_RE, repo_id):
+        raise SystemExit(f"upload: {repo_id!r} is not a repo id like `org/name`")
+    b = Build(workdir)
+    files = checked_files(b)
+    api = HfApi()
+    user = api.whoami()["name"]  # fails clearly when not logged in
+    url = api.create_repo(repo_id, repo_type="dataset", private=True, exist_ok=True)
+    private = api.dataset_info(repo_id).private
+    log(f"upload: {len(files):,} files, {human_bytes(sum(f['size'] for f in files.values()))} as {user} "
+        f"to {url} ({'private' if private else 'PUBLIC'})")
+
+    folder = stage_upload_folder(b, files, repo_id)
+    card = (folder / "README.md").read_bytes()
+    expected = {**files, "README.md": {"size": len(card), "sha256": hashlib.sha256(card).hexdigest(),
+                                       "git_sha1": git_blob_sha1(card)}}
+    n_athletes = sum(rel.startswith("data/timeseries/") for rel in files)
+    message = (f"OpenData: converter {gcod.CONVERTER_VERSION}, conventions {C.VERSION}, "
+               f"{n_athletes:,} athletes with time series")
+    commit = api.upload_folder(repo_id=repo_id, repo_type="dataset", folder_path=folder,
+                               commit_message=message, delete_patterns=["*"])
+    log(f"upload: committed {commit.oid} ; verifying every file on the Hub ...")
+
+    remote = list(api.list_repo_tree(repo_id, repo_type="dataset", recursive=True, revision=commit.oid))
+    problems = remote_differences(expected, remote)
+    for p in problems[:20]:
+        log(f"  {p}")
+    if problems:
+        log(f"upload: FAIL, {len(problems)} files on the Hub don't match the checked dataset folder")
+        return 1
+    with b.uploads.open("a") as f:
+        f.write(json.dumps({"repo_id": repo_id, "commit": commit.oid, "private": private,
+                            "uploaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            "converter": gcod.CONVERTER_VERSION, "conventions": C.VERSION,
+                            "files": len(expected), "bytes": sum(e["size"] for e in expected.values())}) + "\n")
+    shutil.rmtree(folder)
+    log(f"upload: PASS, all {len(expected):,} files on the Hub match ({url})")
+    return 0
 
 
 def _load_validator():
@@ -959,6 +1112,8 @@ def main() -> None:
     k.add_argument("--text-fraction", type=float, default=0.05,
                    help="share of athletes also checked at the text level (slow; default 0.05)")
     k.add_argument("--seed", type=int, default=0)
+    u = sub.add_parser("upload", help="upload the checked dataset folder to a Hugging Face dataset repo")
+    u.add_argument("--repo", required=True, metavar="ORG/NAME", help="e.g. GoldenCheetah/opendata-test")
     a = ap.parse_args()
 
     def request_stop(signum, _frame):
@@ -967,8 +1122,9 @@ def main() -> None:
         log(f"received {signal.Signals(signum).name}; finishing up (work done so far is kept) ...")
         STOP.set()
 
-    signal.signal(signal.SIGINT, request_stop)
-    signal.signal(signal.SIGTERM, request_stop)
+    if a.stage != "upload":  # upload: Ctrl-C stops at once (it resumes when run again)
+        signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGTERM, request_stop)
 
     a.workdir.mkdir(parents=True, exist_ok=True)
     log(f"migrate {a.stage}, workdir {a.workdir}, pid {os.getpid()}")
@@ -980,6 +1136,8 @@ def main() -> None:
         sys.exit(stage_convert(a.workdir, a.jobs, a.athletes, a.athletes_from, a.allow_errors))
     elif a.stage == "check":
         sys.exit(stage_check(a.workdir, a.jobs, a.text_fraction, a.seed))
+    elif a.stage == "upload":
+        sys.exit(stage_upload(a.workdir, a.repo))
 
 
 if __name__ == "__main__":

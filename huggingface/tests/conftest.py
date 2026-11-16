@@ -2,7 +2,7 @@
 
 Run from huggingface/:
 
-    uv run --with pytest --with polars --with pyarrow --with pyyaml --with httpx pytest tests -q
+    uv run --with pytest --with polars --with pyarrow --with pyyaml --with httpx --with huggingface_hub pytest tests -q
 """
 
 from __future__ import annotations

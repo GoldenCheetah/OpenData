@@ -129,3 +129,75 @@ def test_a_json_problem_is_reported_before_anything_is_written(tmp_path: Path, z
     assert migrate.stage_convert(workdir, jobs=1, athletes=None, athletes_from=None, allow_errors=True) == 0
     assert pl.read_parquet(data / "athletes" / "*.parquet")["athlete_id"].to_list() == [A1]
     assert not list(data.glob("*.tmp"))
+
+
+# --- upload (everything but the network) ---------------------------------------------
+def test_upload_refuses_without_a_passing_check(built: Path):
+    with pytest.raises(SystemExit, match="run `check` first"):
+        migrate.checked_files(migrate.Build(built))
+
+
+def test_upload_refuses_when_the_folder_changed_after_the_check(built: Path):
+    assert migrate.stage_check(built, jobs=1, text_fraction=0.0, seed=0) == 0
+    b = migrate.Build(built)
+    assert migrate.checked_files(b)  # unchanged: fine
+    (b.repo / "README.md").write_text((b.repo / "README.md").read_text() + "\n")
+    with pytest.raises(SystemExit, match="changed since it was checked"):
+        migrate.checked_files(b)
+
+
+def test_a_failed_check_removes_the_record_of_an_earlier_pass(built: Path):
+    assert migrate.stage_check(built, jobs=1, text_fraction=0.0, seed=0) == 0
+    path = built / "build" / "opendata" / "data" / "timeseries" / f"athlete_id={A1}" / "part.parquet"
+    df = pl.read_parquet(path, hive_partitioning=False).with_columns(pl.col("power_w") + 1)
+    C.write_table(df.to_arrow(), path, "timeseries", dataset="opendata", table_name="timeseries")
+    assert migrate.stage_check(built, jobs=1, text_fraction=0.0, seed=0) == 1
+    assert not migrate.Build(built).check_record.exists()
+
+
+def test_the_upload_folder_is_the_checked_folder_with_the_card_for_the_target_repo(built: Path):
+    assert migrate.stage_check(built, jobs=1, text_fraction=0.0, seed=0) == 0
+    b = migrate.Build(built)
+    files = migrate.checked_files(b)
+    folder = migrate.stage_upload_folder(b, files, "someone/opendata-test")
+    assert set(migrate.folder_files(folder)) == set(files)
+    part = f"data/timeseries/athlete_id={A1}/part.parquet"
+    assert (folder / part).stat().st_ino == (b.repo / part).stat().st_ino  # a hard link, not a copy
+    card = (folder / "README.md").read_text()
+    assert "hf://datasets/someone/opendata-test/data/" in card
+    assert f'"{migrate.SPEC.repo_id}"' not in card and f"datasets/{migrate.SPEC.repo_id}/" not in card
+    assert card.replace("someone/opendata-test", migrate.SPEC.repo_id) == (b.repo / "README.md").read_text()
+
+
+def test_remote_differences():
+    from types import SimpleNamespace as NS
+
+    readme = b"# card\n"
+    expected = {"README.md": {"size": 7, "sha256": hashlib.sha256(readme).hexdigest(),
+                              "git_sha1": migrate.git_blob_sha1(readme)},
+                "data/a.parquet": {"size": 10, "sha256": "aa"}, "data/b.parquet": {"size": 20, "sha256": "bb"}}
+    lfs = lambda sha, size: NS(sha256=sha, size=size)  # noqa: E731
+    good = [NS(path=".gitattributes", size=1, blob_id="x", lfs=None),
+            NS(path="data", tree_id="t"),  # a folder
+            NS(path="README.md", size=7, blob_id=migrate.git_blob_sha1(readme), lfs=None),
+            NS(path="data/a.parquet", size=10, blob_id="p", lfs=lfs("aa", 10)),
+            NS(path="data/b.parquet", size=20, blob_id="q", lfs=lfs("bb", 20))]
+    assert migrate.remote_differences(expected, good) == []
+    bad = [good[2], NS(path="data/a.parquet", size=10, blob_id="p", lfs=lfs("ab", 10)),
+           NS(path="data/old.parquet", size=5, blob_id="r", lfs=lfs("cc", 5))]
+    assert migrate.remote_differences(expected, bad) == [
+        "data/a.parquet: sha256 differs", "data/old.parquet: on the Hub but not in the dataset folder",
+        "data/b.parquet: missing on the Hub"]
+    # git's blob id of a small file, as the Hub reports it
+    assert migrate.git_blob_sha1(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"
+
+
+def test_every_file_the_card_points_at_exists(built: Path):
+    import re
+
+    repo = built / "build" / "opendata"
+    card = re.sub(r'"\s*\n\s*"', "", (repo / "README.md").read_text())  # join "..." "..." literals
+    paths = re.findall(r"hf://datasets/[^/]+/[^/]+/([^\"']+)", card)
+    assert len(paths) >= 4 and any("athlete_id=" in p for p in paths)
+    for p in paths:
+        assert list(repo.glob(p)), f"the card shows {p}, which matches no file"
