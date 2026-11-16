@@ -16,26 +16,15 @@ task_categories:
 - time-series-forecasting
 - tabular-regression
 size_categories:
-- 10B<n<100B
-configs:
-- config_name: activities
-  default: true
-  data_files: "data/activities/*.parquet"
-- config_name: athletes
-  data_files: "data/athletes/*.parquet"
-- config_name: timeseries
-  data_files: "data/timeseries/*/*.parquet"
-- config_name: raw_json
-  data_files: "data/raw_json/*.parquet"
-- config_name: timeseries_exceptions
-  data_files: "data/timeseries_exceptions/*.parquet"
+- {{size_category}}
+{{configs}}
 ---
 
 # GoldenCheetah OpenData
 
 Anonymised training data shared by users of the [GoldenCheetah](https://www.goldencheetah.org)
 desktop application between 2018 and 2020: {{n_athletes}} athletes, {{n_activities}} activities,
-~{{n_rows}} one-second samples of power, heart rate, cadence, speed/distance and altitude.
+~{{n_rows}} samples (mostly one per second) of power, heart rate, cadence, speed/distance and altitude.
 
 This is a Parquet conversion of the original release on the Open Science Framework,
 [osf.io/6hfpz](https://osf.io/6hfpz/) (DOI [10.17605/OSF.IO/6HFPZ](https://doi.org/10.17605/OSF.IO/6HFPZ)).
@@ -53,7 +42,8 @@ files can be recovered exactly (see *Exactness* below).
 | `timeseries_exceptions` | tiny | value | the few source values outside the Float32 range (see below) |
 
 Join keys: `athlete_id` (UUID, identical to the OSF zip name) and `activity_id`
-(the original CSV name without `.csv`, i.e. the *local* start time `YYYY_MM_DD_HH_MM_SS`). Other GoldenCheetah
+(the original CSV name without `.csv`, i.e. the *local* start time `YYYY_MM_DD_HH_MM_SS`;
+activities without a CSV use their UTC start time followed by `Z`). Other GoldenCheetah
 datasets on Hugging Face use the same keys, so they join directly to `activities` and `timeseries` here.
 
 ## Usage
@@ -91,7 +81,8 @@ sub-second devices), `distance_m` (cumulative distance in metres; the CSV `km` Ã
 Column names carry their unit and are shared across the GoldenCheetah datasets on Hugging Face. Hive layout
 `timeseries/athlete_id=<uuid>/part.parquet`; `athlete_id` is also a column inside each file. Missing sensor = null. Rows are as recorded:
 gaps (auto-pause, smart recording) are **not** filled. Rows of one activity are contiguous and
-in original order.
+in recorded order, which is not always `time_s` order: `time_s` repeats now and then, and in a
+very few broken recordings it jumps backwards while distance shows the rows are in order.
 
 *Exactness.* GoldenCheetah exported every number with 6 significant digits. Float32 holds any
 6-significant-digit decimal exactly, so the columns are Float32 and nothing is rounded:
@@ -108,16 +99,16 @@ matching it to the local-time CSV name. `sport` is free text as entered in Golde
 15-character availability string (`T`ime, `D`istance, `S`peed, `P`ower, `H`eart rate,
 `C`adence, ...). Metric values given by GoldenCheetah as `[value, weight]` pairs are split into
 `<metric>` and `<metric>__weight`; array metrics (`power_mmp`, `*_dist`, `*_dist_bins`) are
-lists. `has_timeseries` is false for activities without a CSV (e.g. manual entries).
+lists. `has_timeseries` is false for activities without samples (manual entries, days off, ...).
 
 ## Provenance
 
 Converted from the {{n_athletes}} zips in OSF project 6hfpz (sha256 of every source zip in
-`athletes.osf_sha256`) with the scripts in {{code_url}}. Conversion date: {{date}}.
+`athletes.osf_sha256`) with the scripts in {{code_url}} (converter {{converter_version}}, conventions {{conventions_version}}).
 
 ## Citation
 
-Please cite the original dataset{{doi_sentence}}:
+Please cite the original dataset:
 
 ```bibtex
 @misc{gcod2018,

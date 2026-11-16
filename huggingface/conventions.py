@@ -169,8 +169,9 @@ WRITER_PROFILES = {
     # ~2 MB row groups so one athlete or activity can be read without much else.
     "timeseries": WriterProfile(compression_level=15, row_group_size=256_000,
                                 byte_stream_split=("float32", "float64"), dictionary="strings"),
-    # Everything else: pyarrow defaults plus zstd.
-    "table": WriterProfile(compression_level=9, row_group_size=None),
+    # Everything else: zstd, 100k-row row groups. Some tables are wide (hundreds of columns), and
+    # the writer holds a row group in memory; Hugging Face's dataset viewer also prefers ~100k.
+    "table": WriterProfile(compression_level=9, row_group_size=100_000),
 }
 
 # Encodings a column may declare in dataset.toml to override its profile's default. Encoding only
@@ -190,42 +191,115 @@ def default_encoding(profile: str, logical: str) -> str | None:
     return None
 
 
+def plain_schema(schema: Any) -> Any:
+    """The same schema with large_string/large_list replaced by string/list, so that every file
+    uses the same physical types whichever library produced the data (polars uses the large ones)."""
+    import pyarrow as pa
+
+    def plain(t: Any) -> Any:
+        if pa.types.is_large_string(t) or pa.types.is_string_view(t):
+            return pa.string()
+        if pa.types.is_large_list(t) or pa.types.is_list(t):
+            return pa.list_(plain(t.value_type))
+        return t
+
+    return pa.schema([f.with_type(plain(f.type)) for f in schema], metadata=schema.metadata)
+
+
 # Stored in every file's key-value metadata, so a single file says where it belongs.
 FILE_METADATA_KEY = b"goldencheetah"
 
 
-def write_table(table: Any, path: Path, profile: str, *, dataset: str, table_name: str,
-                encodings: dict[str, str] | None = None) -> None:
-    """Write a pyarrow Table with the conventions' settings. The only supported way to write.
+class TableWriter:
+    """Write a Parquet file with the conventions' settings, in pieces, in bounded memory.
+
+    The only supported way to write. Tables passed to `write` are buffered and written in row
+    groups of exactly the profile's size (the last one may be smaller), so the file is identical
+    to writing everything at once. The file appears under its final name only when `close`
+    succeeds; on an error nothing is left behind.
+
+        with TableWriter(path, schema, "timeseries", dataset="opendata", table_name="timeseries") as w:
+            for t in pieces:
+                w.write(t)
 
     `encodings` overrides the profile's default per column (see ENCODINGS); pass the encodings a
-    table declares in dataset.toml (`TableSpec.encodings`)."""
-    import json
+    table declares in dataset.toml (`TableSpec.encodings`).
+    """
 
-    import pyarrow.parquet as pq
+    def __init__(self, path: Path, schema: Any, profile: str, *, dataset: str, table_name: str,
+                 encodings: dict[str, str] | None = None):
+        import json
 
-    p = WRITER_PROFILES[profile]
-    types = {f.name: logical_type(f.type) for f in table.schema}
-    meta = dict(table.schema.metadata or {})
-    meta[FILE_METADATA_KEY] = json.dumps(
-        {"dataset": dataset, "table": table_name, "conventions": VERSION}, sort_keys=True
-    ).encode()
-    table = table.replace_schema_metadata(meta)
-    enc = {c: (encodings or {}).get(c) or default_encoding(profile, t) for c, t in types.items()}
-    kwargs: dict[str, Any] = {
-        "use_dictionary": [c for c, e in enc.items() if e == "dictionary"],
-        "column_encoding": {c: "BYTE_STREAM_SPLIT" for c, e in enc.items() if e == "byte_stream_split"},
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    pq.write_table(
-        table, tmp,
-        compression="zstd", compression_level=p.compression_level,
-        row_group_size=p.row_group_size,
-        use_content_defined_chunking=True, write_page_index=True,
-        **kwargs,
-    )
-    tmp.replace(path)  # never leave a half-written file under its final name
+        import pyarrow.parquet as pq
+
+        p = WRITER_PROFILES[profile]
+        self.row_group_size = p.row_group_size
+        schema = plain_schema(schema)
+        types = {f.name: logical_type(f.type) for f in schema}
+        meta = dict(schema.metadata or {})
+        meta[FILE_METADATA_KEY] = json.dumps(
+            {"dataset": dataset, "table": table_name, "conventions": VERSION}, sort_keys=True
+        ).encode()
+        self.schema = schema.with_metadata(meta)
+        enc = {c: (encodings or {}).get(c) or default_encoding(profile, t) for c, t in types.items()}
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.tmp = self.path.with_name(self.path.name + ".tmp")
+        self.writer = pq.ParquetWriter(
+            self.tmp, self.schema,
+            compression="zstd", compression_level=p.compression_level,
+            use_dictionary=[c for c, e in enc.items() if e == "dictionary"],
+            column_encoding={c: "BYTE_STREAM_SPLIT" for c, e in enc.items() if e == "byte_stream_split"},
+            use_content_defined_chunking=True, write_page_index=True,
+        )
+        self.buffer: list[Any] = []
+        self.buffered = 0
+        self.rows = 0
+
+    def write(self, table: Any) -> None:
+        if table.num_rows == 0:
+            return
+        self.buffer.append(table.cast(self.schema))  # same schema everywhere (also drops metadata)
+        self.buffered += table.num_rows
+        while self.buffered >= self.row_group_size:
+            self._flush(self.row_group_size)
+
+    def _flush(self, n: int) -> None:
+        import pyarrow as pa
+
+        t = pa.concat_tables(self.buffer)
+        self.writer.write_table(t.slice(0, n), row_group_size=n)
+        rest = t.slice(n)
+        self.buffer = [rest] if rest.num_rows else []
+        self.buffered = rest.num_rows
+        self.rows += n
+
+    def close(self) -> None:
+        if self.buffered:
+            self._flush(self.buffered)
+        self.writer.close()
+        self.tmp.replace(self.path)  # never leave a half-written file under its final name
+
+    def abort(self) -> None:
+        self.writer.close()
+        self.tmp.unlink(missing_ok=True)
+
+    def __enter__(self) -> "TableWriter":
+        return self
+
+    def __exit__(self, exc_type: Any, *exc: Any) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self.abort()
+
+
+def write_table(table: Any, path: Path, profile: str, *, dataset: str, table_name: str,
+                encodings: dict[str, str] | None = None) -> None:
+    """Write a whole pyarrow Table at once (see TableWriter, which this uses)."""
+    with TableWriter(path, table.schema, profile, dataset=dataset, table_name=table_name,
+                     encodings=encodings) as w:
+        w.write(table)
 
 
 # --- dataset.toml --------------------------------------------------------------------
@@ -391,6 +465,19 @@ def load_dataset_spec(path: Path) -> DatasetSpec:
         raise SpecError(f"{path}:\n  " + "\n  ".join(errors))
     return DatasetSpec(ds["name"], ds["repo_id"], ds["pretty_name"], ds["license"], ds["conventions"],
                        tables, relations)
+
+
+# --- dataset card --------------------------------------------------------------------
+def card_configs(spec: DatasetSpec) -> str:
+    """The card's YAML `configs`: one subset per table, default table first."""
+    tables = sorted(spec.tables.values(), key=lambda t: not t.default)
+    lines = ["configs:"]
+    for t in tables:
+        lines.append(f"- config_name: {t.name}")
+        if t.default:
+            lines.append("  default: true")
+        lines.append(f'  data_files: "{t.glob}"')
+    return "\n".join(lines)
 
 
 # --- docs ----------------------------------------------------------------------------

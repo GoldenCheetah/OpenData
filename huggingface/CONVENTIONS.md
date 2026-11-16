@@ -147,6 +147,6 @@ Conventions version **0.1**.
 | writer profile | compression | row group | byte stream split | dictionary |
 |---|---|---|---|---|
 | `timeseries` | zstd 15 | 256000 | float32, float64 | strings |
-| `table` | zstd 9 | pyarrow default | - | all |
+| `table` | zstd 9 | 100000 | - | all |
 
 <!-- END GENERATED -->

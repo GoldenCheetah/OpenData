@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["httpx>=0.27", "polars>=1.20"]
+# dependencies = ["httpx>=0.27", "polars>=1.20", "pyarrow>=21", "pyyaml>=6"]
 # ///
 """GoldenCheetah OpenData (GCOD): migrate the OSF release to Hugging Face.
 
@@ -8,12 +8,20 @@ Every stage is resumable and safe to re-run; the files in the work directory are
 
   listing   fetch the OSF file listing (ids, sizes, sha256)  -> <workdir>/osf/listing.parquet
   mirror    download every athlete zip and verify its sha256 -> <workdir>/osf/athletes/<uuid>.zip
-  (convert, check, upload: to follow)
+  convert   zips -> the dataset folder to upload              -> <workdir>/build/opendata/
+  check     validate it, and compare every time series value with the original CSVs
+  (upload: to follow)
 
 Usage (from huggingface/):
 
   uv run datasets/opendata/migrate.py listing
   uv run datasets/opendata/migrate.py mirror [--workers 3]
+  uv run datasets/opendata/migrate.py convert [--jobs N] [--athletes UUID ... | --athletes-from FILE]
+  uv run datasets/opendata/migrate.py check [--jobs N] [--text-fraction 0.05]
+
+`convert` converts an athlete again only when its zip or the converter version changed. It stops
+before writing the metadata tables if any athlete can't be converted (unknown quirks fail loudly);
+`--allow-errors` leaves those athletes out instead.
 
 The full mirror is 6,613 zips / 115.6 GB: ~19 h at the ~1.6 MB/s OSF gives 3 workers. For an
 unattended run on macOS that keeps the machine awake (caffeinate: no idle/system sleep while on
@@ -39,12 +47,13 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +62,10 @@ import httpx
 import polars as pl
 
 HERE = Path(__file__).resolve().parent
+sys.path[:0] = [str(HERE), str(HERE.parents[1])]  # gcod.py next to this file; conventions.py in huggingface/
+
+import conventions as C  # noqa: E402
+import gcod  # noqa: E402
 DEFAULT_WORKDIR = HERE.parents[1] / "data"  # huggingface/data (git-ignored)
 
 OSF_NODE = "6hfpz"
@@ -437,6 +450,463 @@ def stage_mirror(workdir: Path, workers: int, max_passes: int, refresh_listing: 
     return Mirror(workdir, workers).run(targets, max_passes)
 
 
+# --- convert -------------------------------------------------------------------------
+# Output: <workdir>/build/opendata/ (the folder that is uploaded: README.md + data/).
+# State:  <workdir>/build/manifest.jsonl, one line per converted athlete (source sha256, converter
+#         version, samples per activity, errors); <workdir>/build/staging/ for per-athlete
+#         exceptions. An athlete is converted again only if its zip or the converter changed.
+# Heavy stages use half the cores at low priority by default, so the machine stays usable. Memory
+# per process is bounded (streaming per activity): about 1 GB at most, measured on the largest
+# athlete in the release.
+DEFAULT_JOBS = max(1, (os.cpu_count() or 2) // 2)
+SPEC_PATH = HERE / "dataset.toml"
+SPEC = C.load_dataset_spec(SPEC_PATH)
+CARD_TEMPLATE = HERE / "README.md.tmpl"
+ACTIVITIES_PART_ROWS = 300_000       # parts of `activities` (3 row groups, ~300 MB)
+RAW_JSON_PART_BYTES = 256 * 10**6     # ~256 MB (uncompressed) parts of `raw_json`
+
+
+@dataclass
+class Build:
+    workdir: Path
+
+    @property
+    def root(self) -> Path:
+        return self.workdir / "build"
+
+    @property
+    def repo(self) -> Path:
+        return self.root / "opendata"
+
+    @property
+    def staging(self) -> Path:
+        return self.root / "staging"
+
+    @property
+    def manifest(self) -> Path:
+        return self.root / "manifest.jsonl"
+
+    def zip_path(self, athlete_id: str) -> Path:
+        return self.workdir / "osf" / "athletes" / f"{athlete_id}.zip"
+
+    def ts_file(self, athlete_id: str) -> Path:
+        return self.repo / C.partition_file("timeseries", "athlete_id", athlete_id)
+
+    def exc_file(self, athlete_id: str) -> Path:
+        return self.staging / "exceptions" / f"{athlete_id}.parquet"
+
+
+def load_manifest(path: Path) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                r = json.loads(line)
+                out[r["athlete_id"]] = r  # last line wins
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return out
+
+
+def ts_arrow_schema():
+    import pyarrow as pa
+
+    return pa.schema([(c, pa.string()) for c in ("athlete_id", "activity_id")] +
+                     [(o, pa.float32()) for o in gcod.TS_COLUMNS.values()])
+
+
+def convert_timeseries_worker(athlete_id: str, sha256: str, workdir: str) -> dict:
+    """Time series of one athlete -> its partition file + staged exceptions. Runs in a subprocess.
+
+    Streams one activity at a time into the file, so memory stays bounded by the largest activity
+    whatever the athlete's size (the writer buffers at most one row group).
+    """
+    _low_priority()
+    b = Build(Path(workdir))
+    entry = {"athlete_id": athlete_id, "sha256": sha256, "converter": gcod.CONVERTER_VERSION}
+    path = b.ts_file(athlete_id)
+    writer = None
+    samples: dict[str, int] = {}
+    exceptions: list[pl.DataFrame] = []
+    try:
+        with gcod.open_athlete_zip(b.zip_path(athlete_id)) as az:
+            for aid, src in gcod.iter_source_activities(az):
+                out, exc = gcod.to_output_timeseries(src)
+                samples[aid] = src.height
+                if exc.height:
+                    exceptions.append(exc)
+                if out.height:
+                    if writer is None:
+                        writer = C.TableWriter(path, ts_arrow_schema(), "timeseries", dataset="opendata",
+                                               table_name="timeseries", encodings=SPEC.tables["timeseries"].encodings)
+                    writer.write(out.to_arrow())
+        if writer is not None:
+            writer.close()
+        elif path.exists():
+            shutil.rmtree(path.parent)
+    except gcod.GcodError as e:
+        if writer is not None:
+            writer.abort()
+        return {**entry, "status": "error", "error": str(e)}
+    except BaseException:
+        if writer is not None:
+            writer.abort()
+        raise
+    exc_all = pl.concat(exceptions) if exceptions else pl.DataFrame(schema=gcod.EXCEPTIONS_SCHEMA)
+    if exc_all.height:
+        b.exc_file(athlete_id).parent.mkdir(parents=True, exist_ok=True)
+        exc_all.write_parquet(b.exc_file(athlete_id))
+    else:
+        b.exc_file(athlete_id).unlink(missing_ok=True)
+    return {**entry, "status": "ok", "rows": sum(samples.values()), "exceptions": exc_all.height, "samples": samples}
+
+
+def _low_priority() -> None:
+    """Run heavy work at low CPU priority so the machine stays usable."""
+    try:
+        if os.getpriority(os.PRIO_PROCESS, 0) < 10:
+            os.nice(10)
+    except OSError:
+        pass
+
+
+def metadata_forms_worker(athlete_id: str, workdir: str) -> dict[str, list[str]]:
+    with gcod.open_athlete_zip(Build(Path(workdir)).zip_path(athlete_id)) as az:
+        return {k: sorted(v) for k, v in gcod.metric_forms(az.meta or {}).items()}
+
+
+def metadata_worker(athlete_id: str, workdir: str, kinds: dict[str, str], samples: dict[str, int]):
+    """(activities as Arrow, athletes row, original JSON text) for one athlete."""
+    with gcod.open_athlete_zip(Build(Path(workdir)).zip_path(athlete_id)) as az:
+        acts = gcod.build_activities(az, kinds, samples)
+        n_ts = sum(1 for n in samples.values() if n > 0)
+        return acts.to_arrow(), gcod.athlete_row(az, acts.height, n_ts), az.json_text
+
+
+def _replace_dir(tmp: Path, final: Path) -> None:
+    """Swap a freshly written table folder into place (old files never mix with new ones)."""
+    old = final.with_name(final.name + ".old")
+    if old.exists():
+        shutil.rmtree(old)
+    if final.exists():
+        final.rename(old)
+    tmp.rename(final)
+    if old.exists():
+        shutil.rmtree(old)
+
+
+def select_athletes(workdir: Path, listing: pl.DataFrame, athletes: list[str] | None,
+                    athletes_from: Path | None) -> pl.DataFrame:
+    ath = listing.filter("is_athlete").sort("athlete_id")
+    wanted = set(athletes or [])
+    if athletes_from:
+        if athletes_from.suffix == ".parquet":
+            wanted |= set(pl.read_parquet(athletes_from)["athlete_id"].to_list())
+        else:
+            wanted |= {s.strip() for s in athletes_from.read_text().split() if s.strip()}
+    if wanted:
+        unknown = wanted - set(ath["athlete_id"])
+        if unknown:
+            raise SystemExit(f"not in the OSF listing: {sorted(unknown)[:5]} ({len(unknown)} total)")
+        ath = ath.filter(pl.col("athlete_id").is_in(sorted(wanted)))
+    verified = {json.loads(line)["athlete_id"] for line in (workdir / "osf" / "verified.jsonl").read_text().splitlines()
+                if line.strip()} if (workdir / "osf" / "verified.jsonl").exists() else set()
+    missing = [a for a in ath["athlete_id"] if a not in verified or not Build(workdir).zip_path(a).exists()]
+    if missing:
+        raise SystemExit(f"{len(missing)} selected zips are not mirrored yet (e.g. {missing[:3]}); "
+                         f"run `mirror` first or select fewer athletes")
+    return ath
+
+
+def stage_convert(workdir: Path, jobs: int, athletes: list[str] | None, athletes_from: Path | None,
+                  allow_errors: bool) -> int:
+    b = Build(workdir)
+    listing = pl.read_parquet(workdir / "osf" / "listing.parquet")
+    sel = select_athletes(workdir, listing, athletes, athletes_from)
+    ids = sel["athlete_id"].to_list()
+    sha = dict(zip(sel["athlete_id"], sel["sha256"]))
+    b.repo.mkdir(parents=True, exist_ok=True)
+    log(f"convert: {len(ids):,} athletes -> {b.repo}")
+
+    # 1. time series, per athlete, resumable
+    manifest = load_manifest(b.manifest)
+    todo = [a for a in ids
+            if not (m := manifest.get(a)) or m["sha256"] != sha[a] or m["converter"] != gcod.CONVERTER_VERSION
+            or m["status"] != "ok" or (m["rows"] and not b.ts_file(a).exists())]
+    log(f"timeseries: {len(ids) - len(todo):,} athletes up to date, {len(todo):,} to convert")
+    t0 = time.monotonic()
+    with ProcessPoolExecutor(jobs) as ex, b.manifest.open("a") as mf:
+        futs = {ex.submit(convert_timeseries_worker, a, sha[a], str(workdir)): a for a in todo}
+        for i, f in enumerate(as_completed(futs), 1):
+            if STOP.is_set():
+                ex.shutdown(cancel_futures=True)
+                log("stopped; re-run to resume")
+                return 130
+            r = f.result()
+            mf.write(json.dumps(r) + "\n")
+            mf.flush()
+            manifest[r["athlete_id"]] = r
+            if r["status"] != "ok":
+                log(f"ERROR {r['athlete_id']}: {r['error']}")
+            if i % 50 == 0 or i == len(todo):
+                el = time.monotonic() - t0
+                log(f"timeseries: {i:,}/{len(todo):,} athletes, {el / i:.1f} s/athlete, "
+                    f"ETA {human_duration(el / i * (len(todo) - i))}")
+    errors = {a: manifest[a]["error"] for a in ids if manifest[a]["status"] != "ok"}
+    if errors:
+        log(f"{len(errors)} athletes could not be converted:")
+        for a, e in sorted(errors.items()):
+            log(f"  {a}: {e}")
+        if not allow_errors:
+            log("not writing the other tables; fix the converter or pass --allow-errors to leave these athletes out")
+            return 1
+    ok_ids = [a for a in ids if a not in errors]
+    # time series files of athletes no longer selected must not linger in the output
+    for d in (b.repo / "data" / "timeseries").glob("athlete_id=*"):
+        if d.name.split("=", 1)[1] not in set(ok_ids):
+            shutil.rmtree(d)
+
+    # 2. metric schema over all selected athletes
+    log("metadata: collecting the metric schema ...")
+    forms: dict[str, set[str]] = {}
+    with ProcessPoolExecutor(jobs) as ex:
+        for fm in ex.map(metadata_forms_worker, ok_ids, [str(workdir)] * len(ok_ids), chunksize=16):
+            for k, v in fm.items():
+                forms.setdefault(k, set()).update(v)
+    kinds = gcod.metric_kinds(forms)
+    log(f"metadata: {len(kinds)} metrics ({sum(k == 'scalar' for k in kinds.values())} scalar, "
+        f"{sum(k == 'pair' for k in kinds.values())} value+weight, {sum(k == 'list' for k in kinds.values())} list)")
+
+    # 3. activities, athletes, raw_json (in athlete order; batched to bound memory)
+    import pyarrow as pa
+
+    tmp = {t: b.repo / "data" / f"{t}.tmp" for t in ("activities", "athletes", "raw_json", "timeseries_exceptions")}
+    for d in tmp.values():
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
+    json_buf: list[dict] = []
+    json_bytes = json_part = 0
+    athlete_rows: list[dict] = []
+    act_writer: C.TableWriter | None = None
+    act_part = 0
+
+    def write_activities(t: pa.Table) -> None:
+        """Stream into the current part file (the writer holds at most one row group in memory);
+        start a new part every ACTIVITIES_PART_ROWS rows."""
+        nonlocal act_writer, act_part
+        if act_writer is None:
+            act_writer = C.TableWriter(tmp["activities"] / f"part-{act_part:05d}.parquet", t.schema, "table",
+                                       dataset="opendata", table_name="activities",
+                                       encodings=SPEC.tables["activities"].encodings)
+        act_writer.write(t)
+        if act_writer.rows + act_writer.buffered >= ACTIVITIES_PART_ROWS:
+            act_writer.close()
+            act_writer, act_part = None, act_part + 1
+
+    def flush_json() -> None:
+        nonlocal json_buf, json_bytes, json_part
+        if json_buf:
+            t = pa.Table.from_pylist(json_buf, schema=pa.schema([("athlete_id", pa.string()), ("json", pa.string())]))
+            C.write_table(t, tmp["raw_json"] / f"part-{json_part:05d}.parquet", "table",
+                          dataset="opendata", table_name="raw_json")
+            json_buf, json_bytes, json_part = [], 0, json_part + 1
+
+    batch_size = 4 * jobs  # few results in flight, so they can't pile up while parts are written
+    next_log = 0
+    try:
+        with ProcessPoolExecutor(jobs) as ex:
+            for start in range(0, len(ok_ids), batch_size):
+                batch = ok_ids[start:start + batch_size]
+                results = ex.map(metadata_worker, batch, [str(workdir)] * len(batch), [kinds] * len(batch),
+                                 [manifest[a].get("samples", {}) for a in batch])
+                for a, (acts, arow, text) in zip(batch, results):
+                    write_activities(acts)
+                    athlete_rows.append(arow)
+                    json_buf.append({"athlete_id": a, "json": text})
+                    json_bytes += len(text)
+                    if json_bytes >= RAW_JSON_PART_BYTES:
+                        flush_json()
+                done = min(start + batch_size, len(ok_ids))
+                if done >= next_log or done == len(ok_ids):
+                    log(f"metadata: {done:,}/{len(ok_ids):,} athletes")
+                    next_log = done + 250
+                if STOP.is_set():
+                    log("stopped; re-run to resume")
+                    return 130
+        if act_writer is not None:
+            act_writer.close()
+    except BaseException:
+        if act_writer is not None:
+            act_writer.abort()
+        raise
+    flush_json()
+
+    prov = sel.select("athlete_id", osf_file_id="osf_file_id", osf_sha256="sha256",
+                      osf_size_bytes="size", osf_date_created="date_created")
+    athletes_df = pl.DataFrame(athlete_rows, schema_overrides={"yob": pl.Int64}).join(prov, on="athlete_id", how="left")
+    order = [c.name for c in SPEC.tables["athletes"].columns]
+    C.write_table(athletes_df.select(order).sort("athlete_id").to_arrow(), tmp["athletes"] / "athletes.parquet",
+                  "table", dataset="opendata", table_name="athletes")
+
+    exc_files = [b.exc_file(a) for a in ok_ids if b.exc_file(a).exists()]
+    exc = (pl.concat([pl.read_parquet(p) for p in exc_files]) if exc_files
+           else pl.DataFrame(schema=gcod.EXCEPTIONS_SCHEMA)).sort("athlete_id", "activity_id", "row_in_activity", "column")
+    C.write_table(exc.to_arrow(), tmp["timeseries_exceptions"] / "exceptions.parquet", "table",
+                  dataset="opendata", table_name="timeseries_exceptions")
+
+    for t, d in tmp.items():
+        _replace_dir(d, b.repo / "data" / t)
+
+    # 4. dataset card
+    n_rows = sum(manifest[a]["rows"] for a in ok_ids)
+    write_card(b.repo, n_athletes=len(ok_ids), n_activities=int(athletes_df["n_activities"].sum()), n_rows=n_rows)
+    log(f"convert: done. {len(ok_ids):,} athletes, {athletes_df['n_activities'].sum():,} activities, "
+        f"{n_rows:,} samples, {exc.height:,} exception values -> {b.repo}")
+    if errors:
+        log(f"left out {len(errors)} athletes that could not be converted (see above)")
+    return 0
+
+
+def write_card(repo: Path, n_athletes: int, n_activities: int, n_rows: int) -> None:
+    text = CARD_TEMPLATE.read_text()
+    values = {
+        "configs": C.card_configs(SPEC),
+        "repo_id": SPEC.repo_id,
+        "n_athletes": f"{n_athletes:,}",
+        "n_activities": f"{n_activities:,}",
+        "n_rows": f"{n_rows / 1e9:.1f} billion" if n_rows >= 1e9 else f"{n_rows / 1e6:.0f} million",
+        "size_category": next(c for lim, c in [(1e6, "100K<n<1M"), (1e7, "1M<n<10M"), (1e8, "10M<n<100M"),
+                                                (1e9, "100M<n<1B"), (1e10, "1B<n<10B"), (1e11, "10B<n<100B"),
+                                                (float("inf"), "n>100B")] if n_rows < lim),
+        "code_url": "https://github.com/GoldenCheetah/OpenData/tree/master/huggingface",
+        "converter_version": gcod.CONVERTER_VERSION,
+        "conventions_version": C.VERSION,
+    }
+    for k, v in values.items():
+        text = text.replace("{{" + k + "}}", v)
+    left = sorted(set(re.findall(r"\{\{(\w+)\}\}", text)))
+    if left:
+        raise SystemExit(f"card template has unfilled placeholders: {left}")
+    (repo / "README.md").write_text(text)
+
+
+# --- check ---------------------------------------------------------------------------
+class _RowStream:
+    """Read a Parquet file sequentially, n rows at a time, without loading it whole."""
+
+    def __init__(self, path: Path):
+        import pyarrow.parquet as pq
+
+        self.batches = pq.ParquetFile(path).iter_batches(batch_size=65_536) if path.exists() else iter(())
+        self.buf: list[pl.DataFrame] = []
+        self.n = 0
+
+    def take(self, n: int) -> pl.DataFrame:
+        while self.n < n:
+            b = next(self.batches, None)
+            if b is None:
+                break
+            df = pl.from_arrow(b)
+            self.buf.append(df)
+            self.n += df.height
+        if not self.buf:
+            return pl.DataFrame()
+        all_ = pl.concat(self.buf) if len(self.buf) > 1 else self.buf[0]
+        head, rest = all_.head(n), all_.slice(n)
+        self.buf, self.n = ([rest] if rest.height else []), rest.height
+        return head
+
+    def exhausted(self) -> bool:
+        return self.n == 0 and next(self.batches, None) is None
+
+
+def check_worker(athlete_id: str, workdir: str, text_level: bool) -> dict:
+    """Compare one athlete's written time series, read back from disk, with the source CSVs.
+
+    Every value: the stored Float32 is the Float32 of the source value. With `text_level`, also
+    that it prints back as the source number (slow). Streams activity by activity.
+    """
+    _low_priority()
+    b = Build(Path(workdir))
+    exc_path = b.exc_file(athlete_id)
+    exc = pl.read_parquet(exc_path) if exc_path.exists() else pl.DataFrame(schema=gcod.EXCEPTIONS_SCHEMA)
+    stream = _RowStream(b.ts_file(athlete_id))
+    values = differ = 0
+    errors = []
+    with gcod.open_athlete_zip(b.zip_path(athlete_id)) as az:
+        for aid, src in gcod.iter_source_activities(az):
+            if src.height == 0:
+                continue
+            out = stream.take(src.height)
+            if out.height != src.height or (out["activity_id"] != aid).any():
+                errors.append(f"activity {aid}: rows don't line up with the CSV")
+                break
+            values += src.height * len(gcod.TS_COLUMNS)
+            exc_a = exc.filter(pl.col("activity_id") == aid)
+            differ += gcod.cast_mismatches(src, out)
+            if text_level:
+                differ += gcod.same_as_source(src, out, exc_a)
+            if exc_a.height:  # exceptions hold the exact source values
+                restored = exc_a.join(
+                    src.unpivot(index=["activity_id", "row_in_activity"], on=list(gcod.TS_COLUMNS),
+                                variable_name="source_column", value_name="v"),
+                    on=["activity_id", "row_in_activity", "source_column"], how="left")
+                differ += restored.filter(pl.col("v") != pl.col("source_value")).height + restored["v"].null_count()
+    if not errors and not stream.exhausted():
+        errors.append("the file has more rows than the CSVs")
+    return {"athlete_id": athlete_id, "values": values, "differ": differ,
+            "error": "; ".join(errors) or None, "text_level": text_level}
+
+
+def stage_check(workdir: Path, jobs: int, text_fraction: float, seed: int) -> int:
+    b = Build(workdir)
+    validate = _load_validator()
+    log("check: validating the dataset against dataset.toml and the conventions ...")
+    status = validate.validate(SPEC_PATH, b.repo, jobs, None)
+
+    manifest = load_manifest(b.manifest)
+    present = sorted(d.name.split("=", 1)[1] for d in (b.repo / "data" / "timeseries").glob("athlete_id=*"))
+    ids = [a for a in present if manifest.get(a, {}).get("status") == "ok"]
+    text_ids = set(random.Random(seed).sample(ids, round(len(ids) * text_fraction))) if ids else set()
+    log(f"check: every time series value of {len(ids):,} athletes against the original CSVs "
+        f"(text level for {len(text_ids):,}) ...")
+    total = differ = 0
+    problems = []
+    with ProcessPoolExecutor(jobs) as ex:
+        for r in ex.map(check_worker, ids, [str(workdir)] * len(ids), [a in text_ids for a in ids], chunksize=1):
+            total += r["values"]
+            if r["error"] or r["differ"]:
+                problems.append(r)
+            differ += r["differ"] or 0
+    for r in problems[:20]:
+        detail = r["error"] or f"{r['differ']:,} values differ"
+        log(f"  {r['athlete_id']}: {detail}")
+
+    # every activity that says it has a time series has samples, and vice versa
+    acts = pl.read_parquet(b.repo / "data" / "activities" / "*.parquet", columns=["athlete_id", "activity_id", "has_timeseries"])
+    in_dataset = set(acts["athlete_id"].unique())
+    counts = pl.DataFrame([{"athlete_id": a, "activity_id": k, "n": n}
+                           for a in in_dataset for k, n in manifest[a].get("samples", {}).items()],
+                          schema={"athlete_id": pl.String, "activity_id": pl.String, "n": pl.Int64})
+    j = acts.join(counts, on=["athlete_id", "activity_id"], how="left").with_columns(pl.col("n").fill_null(0))
+    mismatch = j.filter(pl.col("has_timeseries") != (pl.col("n") > 0)).height
+
+    log(f"check: {total:,} values in {len(ids):,} athletes compared, {differ:,} differ; "
+        f"{len(problems)} athletes with problems; has_timeseries mismatches: {mismatch}")
+    ok = status == 0 and not problems and mismatch == 0
+    log("check: PASS" if ok else "check: FAIL")
+    return 0 if ok else 1
+
+
+def _load_validator():
+    # A regular import (not by file path), so the validator's worker processes can import it too.
+    sys.path.insert(0, str(HERE.parents[1] / "tools"))
+    import validate
+
+    return validate
+
+
 # --- main ---------------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -448,12 +918,23 @@ def main() -> None:
     m.add_argument("--max-passes", type=int, default=8, help="retry rounds for failed zips (default 8)")
     m.add_argument("--refresh-listing", action="store_true", help="re-fetch the OSF listing first")
     m.add_argument("--athletes", nargs="+", metavar="UUID", help="only these athletes (default: all)")
+    c = sub.add_parser("convert", help="convert mirrored zips into the dataset folder")
+    c.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help=f"parallel processes (default {DEFAULT_JOBS})")
+    c.add_argument("--athletes", nargs="+", metavar="UUID", help="only these athletes (default: all)")
+    c.add_argument("--athletes-from", type=Path, metavar="FILE",
+                   help="only the athletes in FILE (one UUID per line, or a parquet with athlete_id)")
+    c.add_argument("--allow-errors", action="store_true", help="leave out athletes that can't be converted")
+    k = sub.add_parser("check", help="validate the dataset folder and check exactness against the zips")
+    k.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help=f"parallel processes (default {DEFAULT_JOBS})")
+    k.add_argument("--text-fraction", type=float, default=0.05,
+                   help="share of athletes also checked at the text level (slow; default 0.05)")
+    k.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
     def request_stop(signum, _frame):
         if STOP.is_set():
             raise SystemExit(130)  # second signal: exit now
-        log(f"received {signal.Signals(signum).name}; finishing up (partial downloads are kept) ...")
+        log(f"received {signal.Signals(signum).name}; finishing up (work done so far is kept) ...")
         STOP.set()
 
     signal.signal(signal.SIGINT, request_stop)
@@ -465,6 +946,10 @@ def main() -> None:
         stage_listing(a.workdir)
     elif a.stage == "mirror":
         sys.exit(stage_mirror(a.workdir, a.workers, a.max_passes, a.refresh_listing, a.athletes))
+    elif a.stage == "convert":
+        sys.exit(stage_convert(a.workdir, a.jobs, a.athletes, a.athletes_from, a.allow_errors))
+    elif a.stage == "check":
+        sys.exit(stage_check(a.workdir, a.jobs, a.text_fraction, a.seed))
 
 
 if __name__ == "__main__":

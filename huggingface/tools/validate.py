@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -82,6 +83,7 @@ class FileResult:
 
 def check_file(path: Path, root: Path, ds: C.DatasetSpec, t: C.TableSpec,
                relation_cols: list[tuple[str, ...]]) -> FileResult:
+    _low_priority()
     f = Findings()
     rel = str(path.relative_to(root))
     pf = pq.ParquetFile(path)
@@ -153,56 +155,90 @@ def check_file(path: Path, root: Path, ds: C.DatasetSpec, t: C.TableSpec,
             elif want == "dictionary" and not {"RLE_DICTIONARY", "PLAIN_DICTIONARY"} & set(col.encodings):
                 once("encoding", name, f"{rel}: {name} should be dictionary-encoded, is {col.encodings}")
 
-    # values: read only the columns some check needs
+    # values: read only the columns some check needs, one row group at a time (bounded memory)
     by_name = {c.name: c for c in t.columns}
     time_col = by_name.get("time_s")
+    time_checks = bool(time_col and (time_col.grid or time_col.monotonic))
     needed = {c.name for c in t.columns if c.required or c.pattern}
     needed |= set(t.key) | {c for cols in relation_cols for c in cols}
     if t.partition_by:
-        needed |= {t.partition_by, "activity_id"} & set(names)
-    if time_col and (time_col.grid or time_col.monotonic):
+        needed |= {t.partition_by, "activity_id"}
+    if time_checks:
         needed |= {"activity_id", "time_s"}
-    needed &= set(names)
-    df = pl.read_parquet(path, columns=sorted(needed), hive_partitioning=False) if needed else pl.DataFrame()
+    needed = sorted(needed & set(names))
 
+    nulls: dict[str, int] = defaultdict(int)
+    distinct: dict[str, set] = defaultdict(set)       # pattern and partition columns
+    runs: list[str] = []                              # activity_id of each run of rows, in order
+    grid_off = backwards = 0
+    time_example = None
+    prev: pl.DataFrame | None = None                  # last row of the previous row group (time checks)
+    keys: dict[tuple[str, ...], set[tuple]] = {cols: set() for cols in relation_cols if set(cols) <= set(needed)}
+    key_rows: list[tuple] | None = [] if t.key and set(t.key) <= set(needed) else None
+    for rg in range(md.num_row_groups if needed else 0):
+        df = pl.from_arrow(pf.read_row_group(rg, columns=needed))
+        for c in t.columns:
+            if c.name in df.columns and c.required:
+                nulls[c.name] += df[c.name].null_count()
+            if c.name in df.columns and (c.pattern or c.name == t.partition_by):
+                distinct[c.name] |= set(df[c.name].drop_nulls().unique().to_list())
+        if t.partition_by and "activity_id" in df.columns and df.height:
+            r = df.select(pl.col("activity_id").filter(pl.col("activity_id") != pl.col("activity_id").shift(1).fill_null("")))
+            seq = r["activity_id"].to_list()
+            if runs and seq and seq[0] == runs[-1]:
+                seq = seq[1:]                         # the same run continues across row groups
+            runs += seq
+        if time_checks and df.height:
+            ext = pl.concat([prev, df.select("activity_id", "time_s")]) if prev is not None else df.select("activity_id", "time_s")
+            d = ext.with_columns(step=pl.col("time_s").diff().over("activity_id")).slice(0 if prev is None else 1)
+            if time_col.grid:
+                g = time_col.grid
+                bad = d.filter(((pl.col("time_s") / g).round(0) * g != pl.col("time_s"))
+                               | (pl.col("step").is_not_null() & (pl.col("step") != g)))
+                grid_off += bad.height
+            else:
+                bad = d.filter(pl.col("step") <= 0)
+                backwards += bad.height
+            if bad.height and time_example is None:
+                time_example = bad["activity_id"][0]
+            prev = df.select("activity_id", "time_s").tail(1)
+        for cols in keys:
+            keys[cols] |= set(df.select(cols).unique().iter_rows())
+        if key_rows is not None:
+            key_rows += list(df.select(t.key).iter_rows())
+
+    for name, n in nulls.items():
+        if n:
+            f.add(t.name, "nulls in required columns", f"{rel}: {name} has {n:,} nulls", n)
     for c in t.columns:
-        if c.name not in df.columns:
-            continue
-        if c.required and (n := df[c.name].null_count()):
-            f.add(t.name, "nulls in required columns", f"{rel}: {c.name} has {n:,} nulls", n)
-        if c.pattern:
-            bad = df.select(pl.col(c.name).drop_nulls().unique()).filter(~pl.col(c.name).str.contains(c.pattern))
-            if bad.height:
-                f.add(t.name, "id format", f"{rel}: {c.name} {bad[c.name].head(3).to_list()}", bad.height)
-
-    if t.partition_by and t.partition_by in df.columns:
+        if c.pattern and c.name in distinct:
+            bad_ids = sorted(v for v in distinct[c.name] if not re.search(c.pattern, v))
+            if bad_ids:
+                f.add(t.name, "id format", f"{rel}: {c.name} {bad_ids[:3]}", len(bad_ids))
+    if t.partition_by and t.partition_by in distinct:
         expected = path.parent.name.split("=", 1)[1]
-        found = df[t.partition_by].unique().to_list()
-        if found != [expected]:
-            f.add(t.name, "partition value", f"{rel}: {t.partition_by} values {found[:3]} in folder {expected}")
-        if "activity_id" in df.columns and df.height:
-            runs = df.select(pl.col("activity_id").filter(pl.col("activity_id") != pl.col("activity_id").shift(1).fill_null("")))
-            seq = runs["activity_id"].to_list()
-            if len(seq) != len(set(seq)):
-                f.add(t.name, "activity rows not contiguous", f"{rel}: {len(seq) - len(set(seq))} activities split")
-            elif seq != sorted(seq):
-                f.add(t.name, "activity order", f"{rel}: activities not in activity_id order")
+        if distinct[t.partition_by] != {expected}:
+            f.add(t.name, "partition value", f"{rel}: {t.partition_by} values {sorted(distinct[t.partition_by])[:3]} in folder {expected}")
+    if runs:
+        if len(runs) != len(set(runs)):
+            f.add(t.name, "activity rows not contiguous", f"{rel}: {len(runs) - len(set(runs))} activities split")
+        elif runs != sorted(runs):
+            f.add(t.name, "activity order", f"{rel}: activities not in activity_id order")
+    if grid_off:
+        f.add(t.name, "time_s grid", f"{rel}: {grid_off:,} samples off the {time_col.grid} s grid, e.g. activity {time_example}", grid_off)
+    if backwards:
+        f.add(t.name, "time_s monotonic", f"{rel}: {backwards:,} non-increasing steps, e.g. activity {time_example}", backwards)
 
-    if time_col and (time_col.grid or time_col.monotonic) and df.height:
-        d = df.select(pl.col("activity_id"), step=pl.col("time_s").diff().over("activity_id"), t=pl.col("time_s"))
-        if time_col.grid:
-            g = time_col.grid
-            off = d.filter(((pl.col("t") / g).round(0) * g != pl.col("t")) | (pl.col("step").is_not_null() & (pl.col("step") != g)))
-            if off.height:
-                f.add(t.name, "time_s grid", f"{rel}: {off.height:,} samples off the {g} s grid, e.g. activity {off['activity_id'][0]}", off.height)
-        else:
-            back = d.filter(pl.col("step") <= 0)
-            if back.height:
-                f.add(t.name, "time_s monotonic", f"{rel}: {back.height:,} non-increasing steps, e.g. activity {back['activity_id'][0]}", back.height)
-
-    keys = {cols: set(df.select(cols).unique().iter_rows()) for cols in relation_cols if set(cols) <= set(df.columns)}
-    key_rows = list(df.select(t.key).iter_rows()) if t.key and set(t.key) <= set(df.columns) else None
     return FileResult(rel, md.num_rows, tuple(types.items()), f, keys, key_rows)
+
+
+def _low_priority() -> None:
+    """Validation is heavy on big datasets: run workers at low CPU priority."""
+    try:
+        if os.getpriority(os.PRIO_PROCESS, 0) < 10:
+            os.nice(10)
+    except OSError:
+        pass
 
 
 # --- per table / dataset -------------------------------------------------------------
@@ -339,7 +375,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("spec", type=Path, help="the dataset's dataset.toml")
     ap.add_argument("root", type=Path, help="the built dataset folder (README.md + data/)")
-    ap.add_argument("--jobs", type=int, default=8)
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
+                    help="parallel processes (default: half the cores)")
     ap.add_argument("--max-files", type=int, help="check only the first N files of each table")
     a = ap.parse_args()
     try:
