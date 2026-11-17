@@ -115,3 +115,16 @@ def test_render_card_refuses_missing_and_unused_values():
     with pytest.raises(ValueError, match="doesn't use"):
         C.render_card("{{repo_id}}", spec, {"extra": "x"})
     assert C.render_card("{{repo_id}}", spec, {}) == "GoldenCheetah/example"
+
+
+def test_the_validator_command_line_takes_another_dataset(example: Path, opendata: Path, monkeypatch):
+    argv = ["validate.py", str(SPEC), str(example), "--jobs", "1",
+            "--against", str(migrate.SPEC_PATH), str(opendata)]
+    monkeypatch.setattr("sys.argv", argv)
+    with pytest.raises(SystemExit) as e:
+        validate.main()
+    assert e.value.code == 0
+    monkeypatch.setattr("sys.argv", argv[:-3])  # without --against: the relations to opendata fail
+    with pytest.raises(SystemExit) as e:
+        validate.main()
+    assert e.value.code == 1

@@ -17,8 +17,8 @@ and `tools/validate.py` checks a built dataset against both.
   datasets. A dataset may leave one out, but never uses its name for something else, and never
   stores it with a different type. A dataset's `dataset.toml` lists shared columns by name only.
 - **Same name, same value.** Where a dataset's row is the same row as in the dataset it derives
-  from (same key), its shared columns hold the same values there: a derived dataset's `sport`
-  for an activity is OpenData's `sport` for that activity. A dataset that changes a value (a normalised
+  from (same key), its shared columns hold the same values: a derived dataset's `sport` for an
+  activity is OpenData's `sport` for that activity. A dataset that changes a value (a normalised
   sport, a corrected start time) puts it in a column with its own name. The validator checks
   this (see [Relations](#relations)).
 - **Other columns** are declared in the dataset's `dataset.toml` with a type, unit and description.
