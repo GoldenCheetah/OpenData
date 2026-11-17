@@ -2,7 +2,7 @@
 
 Run from huggingface/:
 
-    uv run --with pytest --with polars --with pyarrow --with pyyaml --with httpx --with huggingface_hub pytest tests -q
+    uv run --with-requirements tests/requirements.txt pytest tests -q
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import hashlib
 import json
 import sys
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -90,10 +90,22 @@ def write_workdir(workdir: Path, zip_paths: list[Path]) -> None:
         sha = hashlib.sha256(target.read_bytes()).hexdigest()
         st = target.stat()
         rows.append({"osf_file_id": f"id-{z.stem[-4:]}", "path": z.name, "name": z.name, "size": st.st_size,
-                     "md5": None, "sha256": sha, "date_created": datetime(2019, 1, 1, tzinfo=timezone.utc),
+                     "md5": None, "sha256": sha, "date_created": datetime(2019, 1, 1, tzinfo=UTC),
                      "date_modified": datetime(2019, 1, 1), "version": 1, "download_url": "https://example.invalid",
                      "is_athlete": True, "athlete_id": z.stem})
         verified.append(json.dumps({"athlete_id": z.stem, "sha256": sha, "size": st.st_size,
                                     "mtime_ns": st.st_mtime_ns}))
     pl.DataFrame(rows).write_parquet(workdir / "osf" / "listing.parquet")
     (workdir / "osf" / "verified.jsonl").write_text("\n".join(verified) + "\n")
+
+
+@pytest.fixture
+def built(tmp_path: Path, zips: Path) -> Path:
+    """A migrate.py work directory after `convert` of two basic athletes and an empty one."""
+    import migrate
+
+    workdir = tmp_path / "work"
+    paths = [basic_athlete(zips, A1), basic_athlete(zips, A2), make_zip(zips / f"{A3}.zip", [], {})]
+    write_workdir(workdir, paths)
+    assert migrate.stage_convert(workdir, jobs=2, athletes=None, athletes_from=None, allow_errors=False) == 0
+    return workdir

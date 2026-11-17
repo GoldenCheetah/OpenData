@@ -1,0 +1,8 @@
+# Test dependencies: the union of the scripts' inline (PEP 723) dependencies, plus pytest.
+# uv run --with-requirements tests/requirements.txt pytest tests -q
+pytest>=8
+httpx>=0.27
+huggingface_hub>=2.4
+polars>=1.20
+pyarrow>=21
+pyyaml>=6

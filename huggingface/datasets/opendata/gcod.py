@@ -4,9 +4,9 @@ the tables declared in dataset.toml.
 Pure functions over one athlete zip; no I/O besides reading the zip. migrate.py runs them over all
 athletes. Needs polars and pyarrow (declared by migrate.py).
 
-Downloaded zips are untrusted input: they are never extracted, members are read by name, and
-anything unexpected raises GcodError instead of being guessed at. Every quirk handled here was
-found in the sample (research/reports/03, 04) and has a test in tests/.
+Downloaded zips are untrusted input: they are never extracted, and anything unexpected raises
+GcodError instead of being guessed at. Every quirk handled here was found in the release
+(research/reports/03, 04, 13) and has a test in tests/.
 """
 
 from __future__ import annotations
@@ -14,24 +14,27 @@ from __future__ import annotations
 import io
 import json
 import re
+import unicodedata
 import zipfile
-from collections import Counter
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import polars as pl
 
 # Bump when the output for the same input changes; migrate.py then rebuilds affected files.
-CONVERTER_VERSION = "0.3.0"
+CONVERTER_VERSION = "0.4.0"
 
 ATHLETE_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 # Activity CSV member names: the local start time YYYY_MM_DD_HH_MM_SS, usually + `.csv`. GoldenCheetah
 # sometimes kept the original file's extension: `.fit`, `.fit.csv`, `.pwx`, `.csv.bak.csv` (a backup
-# version next to the `.csv`), ... These are CSVs all the same (the header is checked) and are kept
-# as separate activities; their activity_id is the name without a final `.csv`.
-ACTIVITY_MEMBER_RE = re.compile(r"^(\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2})((?:\.[A-Za-z0-9]+)*)$")
+# version next to the `.csv`), `.sync-conflict-20180127-150031-75VG4DH.csv` (a file sync tool's
+# copy of a conflicting version), ... These are CSVs all the same (the header is checked) and are
+# kept as separate activities; their activity_id is the name without a final `.csv`.
+ACTIVITY_MEMBER_RE = re.compile(r"^(\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2})((?:\.[A-Za-z0-9-]+)*)$")
+START_RE = re.compile(r"^\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}")
 
 # CSV column -> output column; km -> m. Order is the order in timeseries.
 CSV_HEADER = ["secs", "km", "power", "hr", "cad", "alt"]
@@ -50,6 +53,9 @@ LIST_METRICS = {
 # Linking JSON rides (UTC `date`) to CSVs (local start time in the name): same mm:ss, offset a
 # whole quarter-hour within +-14 h; greedy by smallest |offset|. Links 99.9% in the sample.
 MAX_OFFSET_S = 14 * 3600
+# A ride "fits" a CSV when its duration and distance metrics agree with the CSV's last `secs` and
+# `km` within these tolerances (absolute, or relative, whichever is larger).
+FIT_TIME_S, FIT_DISTANCE_KM, FIT_RELATIVE = 2.0, 0.01, 0.001
 
 
 class GcodError(Exception):
@@ -57,22 +63,31 @@ class GcodError(Exception):
 
 
 # --- reading a zip -------------------------------------------------------------------
+@dataclass(frozen=True)
+class ActivityMember:
+    """One activity CSV in a zip. Members are identified by their ZipInfo, not their name: a zip
+    can hold two different files under one name."""
+    activity_id: str
+    info: zipfile.ZipInfo
+
+
 @dataclass
 class AthleteZip:
     athlete_id: str
     json_text: str
     meta: dict
-    json_repaired: bool            # the JSON needed parse_gc_json's repair
-    activity_members: list[str]   # CSV members, sorted by activity_id
+    json_repairs: tuple[str, ...]          # the repairs parse_gc_json needed (usually none)
+    activity_members: list[ActivityMember]  # sorted by activity_id
     _zf: zipfile.ZipFile
 
-    def read(self, member: str) -> bytes:
-        return self._zf.read(member)
+    def read(self, member: ActivityMember) -> bytes:
+        with self._zf.open(member.info) as f:
+            return f.read()
 
     def close(self) -> None:
         self._zf.close()
 
-    def __enter__(self) -> "AthleteZip":
+    def __enter__(self) -> AthleteZip:
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -86,24 +101,22 @@ def open_athlete_zip(path: Path) -> AthleteZip:
         raise GcodError(f"zip name {path.name!r} is not an athlete UUID")
     zf = zipfile.ZipFile(path)
     jsons, activities, other = [], [], []
-    seen: dict[str, zipfile.ZipInfo] = {}
+    seen: dict[str, list[zipfile.ZipInfo]] = {}
     for info in zf.infolist():
         if info.is_dir():
             continue
-        # Some zips hold the same member twice. Byte-identical copies are one member; copies that
-        # differ can't be told apart by name, so that fails loudly.
-        if (first := seen.get(info.filename)) is not None:
-            if (first.CRC, first.file_size) == (info.CRC, info.file_size) and \
-                    zf.open(first).read() == zf.open(info).read():
-                continue
-            zf.close()
-            raise GcodError(f"member {info.filename} occurs twice with different content")
-        seen[info.filename] = info
+        # Some zips hold a member twice. Byte-identical copies are one member. Copies that differ
+        # are two versions of the activity (two files with the same start time in the athlete's
+        # library, exported under one name) and are both kept, in zip order.
+        same_name = seen.setdefault(info.filename, [])
+        if any(_same_content(zf, info, earlier) for earlier in same_name):
+            continue
+        same_name.append(info)
         base = info.filename.rsplit("/", 1)[-1]
         if base.endswith(".json"):
             jsons.append(info.filename)
         elif ACTIVITY_MEMBER_RE.match(base):
-            activities.append(info.filename)
+            activities.append(info)
         else:
             other.append(info.filename)
     if other:
@@ -121,34 +134,97 @@ def open_athlete_zip(path: Path) -> AthleteZip:
         zf.close()
         raise GcodError(f"JSON {jsons[0]} is not UTF-8: {e}") from e
     try:
-        meta, repaired = parse_gc_json(json_text)
+        meta, repairs = parse_gc_json(json_text)
     except GcodError as e:
         zf.close()
         raise GcodError(f"invalid JSON {jsons[0]}: {e}") from e
-    return AthleteZip(athlete_id, json_text, meta, repaired, sorted(activities, key=activity_id), zf)
+    ids = unique_ids([activity_id(info.filename) for info in activities])
+    members = sorted((ActivityMember(i, info) for i, info in zip(ids, activities, strict=True)),
+                     key=lambda m: m.activity_id)
+    return AthleteZip(athlete_id, json_text, meta, repairs, members, zf)
 
 
-# GoldenCheetah writes one `"key":"value"` per line and did not escape double quotes inside free-text
-# values (e.g. `"sport":"... "Spring is coming!""`). Only this known bug is repaired; the original
-# text is kept unchanged (raw_json), and athletes.json_repaired records that it happened.
-_STRING_LINE = re.compile(r'^(\s*"[^"\\]+"\s*:\s*")(.*)("\s*,?\s*)$')
+def _same_content(zf: zipfile.ZipFile, a: zipfile.ZipInfo, b: zipfile.ZipInfo) -> bool:
+    if (a.CRC, a.file_size) != (b.CRC, b.file_size):
+        return False
+    with zf.open(a) as fa, zf.open(b) as fb:
+        return fa.read() == fb.read()
 
 
-def parse_gc_json(text: str) -> tuple[dict, bool]:
-    """(parsed JSON, whether it needed the unescaped-quotes repair)."""
+def unique_ids(ids: list[str]) -> list[str]:
+    """Ids made unique in order: the n-th occurrence (n >= 2) of an id gets `~n`."""
+    count: dict[str, int] = {}
+    out = []
+    for i in ids:
+        count[i] = count.get(i, 0) + 1
+        out.append(i if count[i] == 1 else f"{i}~{count[i]}")
+    return out
+
+
+# GoldenCheetah writes its JSON by hand, one `"key":value` per line, and has known bugs. A JSON that
+# doesn't parse is repaired by these, each applied only where its pattern occurs; the original text
+# is kept unchanged (raw_json), and athletes.json_repairs records which repairs were needed.
+#   unescaped_quotes     double quotes inside free text not escaped (`"sport":"... "Spring!""`),
+#                        also where the text runs over several lines
+#   empty_first_metric   a metric left out at the start of METRICS, leaving `{` followed by `,`
+#   control_characters   tabs and line breaks inside free text not escaped (parsed as they are)
+_STRING_START = re.compile(r'^(\s*"[^"\\]+"\s*:\s*")(.*)$', re.S)
+_STRING_LINE = re.compile(r'^(\s*"[^"\\]+"\s*:\s*")(.*)("\s*,?\s*)$', re.S)
+_EMPTY_FIRST_METRIC = re.compile(r'("METRICS"\s*:\s*\{[ \t]*\r?\n)[ \t]*,[ \t]*\r?\n')
+_KEY_OR_BRACKET = re.compile(r'^\s*("[^"\\]+"\s*:|[\[\]{}],?\s*$)')  # JSON structure, never free text
+_MAX_STRING_LINES = 50
+
+
+def _repair_unescaped_quotes(text: str) -> str:
+    lines, out, i = text.split("\n"), [], 0
+    while i < len(lines):
+        line, j = lines[i], i + 1
+        if _STRING_START.match(line) and not _STRING_LINE.match(line):
+            # A string value that doesn't end on its line continues on the next lines of free text,
+            # up to the line where it ends; it never takes in a line that is JSON structure.
+            for k in range(i + 1, min(len(lines), i + _MAX_STRING_LINES)):
+                if _KEY_OR_BRACKET.match(lines[k]):
+                    break
+                if _STRING_LINE.match(joined := "\n".join(lines[i:k + 1])):
+                    line, j = joined, k + 1
+                    break
+        if (m := _STRING_LINE.match(line)) and re.search(r'(?<!\\)"', m.group(2)):
+            line = m.group(1) + re.sub(r'(?<!\\)"', r'\\"', m.group(2)) + m.group(3)
+        out.append(line)
+        i = j
+    return "\n".join(out)
+
+
+def _repair_empty_first_metric(text: str) -> str:
+    return _EMPTY_FIRST_METRIC.sub(r"\1", text)
+
+
+JSON_REPAIRS: dict[str, Callable[[str], str]] = {
+    "unescaped_quotes": _repair_unescaped_quotes,
+    "empty_first_metric": _repair_empty_first_metric,
+}
+
+
+def parse_gc_json(text: str) -> tuple[dict, tuple[str, ...]]:
+    """(parsed JSON, the repairs it needed: names from JSON_REPAIRS and `control_characters`)."""
     try:
-        return json.loads(text), False
+        return json.loads(text), ()
     except json.JSONDecodeError as first:
-        lines = []
-        for line in text.split("\n"):
-            m = _STRING_LINE.match(line)
-            if m and re.search(r'(?<!\\)"', m.group(2)):
-                line = m.group(1) + re.sub(r'(?<!\\)"', r'\\"', m.group(2)) + m.group(3)
-            lines.append(line)
-        try:
-            return json.loads("\n".join(lines)), True
-        except json.JSONDecodeError:
-            raise GcodError(str(first)) from first
+        error = first
+    applied = []
+    for name, repair in JSON_REPAIRS.items():
+        repaired = repair(text)
+        if repaired != text:
+            applied.append(name)
+            text = repaired
+    try:
+        return json.loads(text), tuple(applied)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(text, strict=False), (*applied, "control_characters")
+    except json.JSONDecodeError:
+        raise GcodError(str(error)) from error
 
 
 def activity_id(member: str) -> str:
@@ -161,22 +237,33 @@ def utc_activity_id(t: datetime) -> str:
     return t.strftime("%Y_%m_%d_%H_%M_%S") + "Z"
 
 
+def ascii_digits(s: str) -> str:
+    """Digits of any script as ASCII digits (some dates are written in Thai digits: `๒๐๑๘/๐๓/๐๗`)."""
+    return "".join(str(unicodedata.decimal(c)) if c.isdecimal() else c for c in s)
+
+
 def parse_utc(s: str) -> datetime | None:
     try:
-        return datetime.strptime(s, "%Y/%m/%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+        return datetime.strptime(ascii_digits(s), "%Y/%m/%d %H:%M:%S UTC").replace(tzinfo=UTC)
     except (TypeError, ValueError):
         return None
 
 
-def parse_local(stem: str) -> datetime | None:
-    m = ACTIVITY_MEMBER_RE.match(stem)
+def parse_local(activity_id: str) -> datetime | None:
+    """The local start time an activity_id begins with (None for anything else)."""
+    m = START_RE.match(activity_id)
     if not m:
         return None
-    return datetime.strptime(m.group(1), "%Y_%m_%d_%H_%M_%S").replace(tzinfo=timezone.utc)
+    return datetime.strptime(m.group(0), "%Y_%m_%d_%H_%M_%S").replace(tzinfo=UTC)
 
 
-def match_rides(rides_utc: list[datetime | None], csv_ids: list[str]) -> list[tuple[str | None, int | None]]:
-    """For each JSON ride: (activity_id of its CSV, local-minus-UTC offset in seconds), or (None, None)."""
+def match_rides(rides_utc: list[datetime | None], csv_ids: list[str],
+                fits: Callable[[int, str], bool] | None = None) -> list[tuple[str | None, int | None]]:
+    """For each JSON ride: (activity_id of its CSV, local-minus-UTC offset in seconds), or (None, None).
+
+    One CSV per ride and one ride per CSV, smallest |offset| first. Where that ties (two rides with
+    the same start time, or two CSVs with the same name), a ride that `fits(ride, csv)` comes
+    first, then JSON order and activity_id order."""
     local = {s: parse_local(s) for s in csv_ids}
     cands = []
     for i, u in enumerate(rides_utc):
@@ -187,10 +274,10 @@ def match_rides(rides_utc: list[datetime | None], csv_ids: list[str]) -> list[tu
                 continue
             off = int((lt - u).total_seconds())
             if abs(off) <= MAX_OFFSET_S and off % 900 == 0:
-                cands.append((abs(off), i, s, off))
+                cands.append((abs(off), not (fits and fits(i, s)), i, s, off))
     cands.sort()
     used_r, used_c, out = set(), set(), {}
-    for _, i, s, off in cands:
+    for _, _, i, s, off in cands:
         if i in used_r or s in used_c:
             continue
         used_r.add(i)
@@ -211,20 +298,16 @@ def iter_source_activities(az: AthleteZip) -> Iterator[tuple[str, pl.DataFrame]]
     One activity at a time, so memory is bounded by the largest activity (~228k rows in the
     sample), not by the athlete (up to ~30M rows). Columns: SOURCE_SCHEMA.
     """
-    seen: dict[str, str] = {}
     for m in az.activity_members:
-        aid = activity_id(m)
-        if aid in seen:
-            raise GcodError(f"two CSVs map to activity_id {aid}: {seen[aid]}, {m}")
-        seen[aid] = m
+        aid, name = m.activity_id, m.info.filename
         raw = az.read(m)
         header = raw.split(b"\n", 1)[0].strip().decode("utf-8", "replace").split(",")
         if header != CSV_HEADER:
-            raise GcodError(f"{m}: header {header}, expected {CSV_HEADER}")
+            raise GcodError(f"{name}: header {header}, expected {CSV_HEADER}")
         try:
             df = pl.read_csv(io.BytesIO(raw), schema={c: pl.Float64 for c in CSV_HEADER})
         except Exception as e:  # noqa: BLE001 - polars raises several types; report them all the same way
-            raise GcodError(f"{m}: unreadable CSV ({type(e).__name__}: {e})") from e
+            raise GcodError(f"{name}: unreadable CSV ({type(e).__name__}: {e})") from e
         del raw
         yield aid, df.with_columns(
             athlete_id=pl.lit(az.athlete_id), activity_id=pl.lit(aid),
@@ -349,31 +432,53 @@ def _float(v: Any) -> float | None:
         return None
 
 
-def build_activities(az: AthleteZip, kinds: dict[str, str], samples: dict[str, int]) -> pl.DataFrame:
+def csv_summary(src: pl.DataFrame) -> dict:
+    """What the metadata pass needs to know about one activity's CSV (stored in the manifest):
+    its number of rows, and its last `secs` and `km` (to tell which ride it belongs to)."""
+    return {"rows": src.height, "secs": src["secs"].max(), "km": src["km"].max()}
+
+
+def _metric(ride: dict, name: str) -> float | None:
+    v = (ride.get("METRICS") or {}).get(name)
+    return _float(v[0] if isinstance(v, list) and v else v)
+
+
+def ride_fits_csv(ride: dict, csv: dict | None) -> bool:
+    """Whether a ride's duration and distance metrics describe this CSV."""
+    if not csv or csv["secs"] is None:
+        return False
+    duration = _metric(ride, "workout_time")
+    if duration is None or abs(duration - csv["secs"]) > max(FIT_TIME_S, FIT_RELATIVE * csv["secs"]):
+        return False
+    distance, km = _metric(ride, "total_distance"), csv["km"] or 0.0
+    return abs((distance or 0.0) - km) <= max(FIT_DISTANCE_KM, FIT_RELATIVE * km)
+
+
+def build_activities(az: AthleteZip, kinds: dict[str, str], csvs: dict[str, dict]) -> pl.DataFrame:
     """One row per activity: every JSON ride, plus CSVs that no ride links to.
 
-    `samples` is the number of time series rows per activity_id (from the time series pass);
-    has_timeseries means at least one row.
+    `csvs` has the csv_summary of each activity_id with a CSV (from the time series pass);
+    has_timeseries means at least one row. A ride links to the CSV with its start time (see
+    match_rides). Two rides with the same start time are both kept: one links to the CSV, the other
+    has no CSV in the release and gets a `Z` id.
     """
     meta = az.meta or {}
     rides = unique_rides(meta.get("RIDES", []))
-    csv_ids = [activity_id(m) for m in az.activity_members]
+    csv_ids = [m.activity_id for m in az.activity_members]
     utc = [parse_utc(r.get("date", "")) for r in rides]
-    links = match_rides(utc, csv_ids)
-    rows, linked = [], set()
-    for r, u, (aid, off) in zip(rides, utc, links):
-        if aid is None:
-            if u is None:
-                raise GcodError(f"ride without CSV and without a valid date: {r.get('date')!r}")
-            aid = utc_activity_id(u)
-        else:
-            linked.add(aid)
+    links = match_rides(utc, csv_ids, fits=lambda i, s: ride_fits_csv(rides[i], csvs.get(s)))
+    for r, u, (aid, _) in zip(rides, utc, links, strict=True):
+        if aid is None and u is None:
+            raise GcodError(f"ride without CSV and without a valid date: {r.get('date')!r}")
+    z_ids = iter(unique_ids([utc_activity_id(u) for u, (aid, _) in zip(utc, links, strict=True) if aid is None]))
+    rows = []
+    for r, u, (aid, off) in zip(rides, utc, links, strict=True):
         row = {
-            "athlete_id": az.athlete_id, "activity_id": aid, "start_time_utc": u,
+            "athlete_id": az.athlete_id, "activity_id": aid or next(z_ids), "start_time_utc": u,
             "utc_offset_minutes": None if off is None else off // 60,
             "sport": r.get("sport"), "data_flags": r.get("data"),
             "xdata": json.dumps(r["XDATA"], sort_keys=True) if "XDATA" in r else None,
-            "has_timeseries": samples.get(aid, 0) > 0,
+            "has_timeseries": csvs.get(aid, {}).get("rows", 0) > 0,
         }
         m = r.get("METRICS") or {}
         unknown = set(m) - set(kinds)
@@ -391,46 +496,40 @@ def build_activities(az: AthleteZip, kinds: dict[str, str], samples: dict[str, i
             else:
                 row[k] = _float(v)
         rows.append(row)
+    linked = {aid for aid, _ in links if aid}
     for aid in csv_ids:  # CSVs that no JSON ride links to
         if aid not in linked:
-            rows.append({"athlete_id": az.athlete_id, "activity_id": aid, "has_timeseries": samples.get(aid, 0) > 0})
+            rows.append({"athlete_id": az.athlete_id, "activity_id": aid,
+                         "has_timeseries": csvs.get(aid, {}).get("rows", 0) > 0})
     df = pl.DataFrame(rows, schema=activities_schema(kinds), strict=False)
     dup = df.filter(pl.col("activity_id").is_duplicated())
-    if dup.height:
+    if dup.height:  # can't happen by construction; a guard against regressions
         raise GcodError(f"duplicate activity_id {dup['activity_id'].unique().to_list()[:5]}")
     return df.sort("start_time_utc", "activity_id", nulls_last=True)
 
 
 def unique_rides(rides: list[dict]) -> list[dict]:
-    """Rides without byte-for-byte duplicates (some JSONs list a ride twice). Two different rides
-    with the same start time can't both be kept under one key: that fails loudly."""
-    out, by_date = [], {}
+    """Rides without byte-for-byte duplicates (some JSONs list a ride twice), in JSON order."""
+    seen: set[str] = set()
+    out = []
     for r in rides:
         key = json.dumps(r, sort_keys=True)
-        date = r.get("date")
-        if date in by_date:
-            if by_date[date] == key:
-                continue
-            raise GcodError(f"two different rides start at {date}")
-        by_date[date] = key
-        out.append(r)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
     return out
 
 
 def athlete_row(az: AthleteZip, n_activities: int, n_timeseries: int) -> dict:
     ath = (az.meta or {}).get("ATHLETE", {})
-    yob = str(ath.get("yob", ""))
+    yob = ascii_digits(str(ath.get("yob", "")))
     return {
         "athlete_id": az.athlete_id,
         "gender": ath.get("gender") or None,
-        "yob": int(yob) if yob.isdigit() else None,
+        "yob": int(yob) if yob.isascii() and yob.isdigit() else None,
         "json_athlete_id": (ath.get("id") or "").strip("{}") or None,
         "gc_json_version": (az.meta or {}).get("VERSION"),
-        "json_repaired": az.json_repaired,
+        "json_repairs": list(az.json_repairs),
         "n_activities": n_activities,
         "n_timeseries": n_timeseries,
     }
-
-
-def form_counter(forms: dict[str, set[str]]) -> Counter:
-    return Counter(f for fs in forms.values() for f in fs)

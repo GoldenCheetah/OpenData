@@ -16,6 +16,11 @@ and `tools/validate.py` checks a built dataset against both.
 - **Shared columns** ([reference](#reference)) have one name, type, unit and meaning across all
   datasets. A dataset may leave one out, but never uses its name for something else, and never
   stores it with a different type. A dataset's `dataset.toml` lists shared columns by name only.
+- **Same name, same value.** Where a dataset's row is the same row as in the dataset it derives
+  from (same key), its shared columns hold the same values there: a derived dataset's `sport`
+  for an activity is OpenData's `sport` for that activity. A dataset that changes a value (a normalised
+  sport, a corrected start time) puts it in a column with its own name. The validator checks
+  this (see [Relations](#relations)).
 - **Other columns** are declared in the dataset's `dataset.toml` with a type, unit and description.
   Names are lower `snake_case`; names of physical quantities end in their unit (`_s`, `_min`, `_m`,
   `_w`, `_wkg`, `_bpm`, `_rpm`, `_kg`, `_bytes`).
@@ -32,10 +37,15 @@ and `tools/validate.py` checks a built dataset against both.
   OSF). Every dataset derived from it uses the same id.
 - `activity_id`: unique within an athlete. It is the local start time from the original CSV name,
   `YYYY_MM_DD_HH_MM_SS`. A few CSVs carry the original file's extension (`.fit`, `.pwx`,
-  `.csv.bak`, ...), which is kept: the release has activities whose only difference is that
-  suffix, such as a backup version next to the regular one. Activities without a CSV (manual entries, days
-  off, ...) use their UTC start time followed by `Z`: `2017_01_31_17_36_44Z`. The `Z` keeps these
-  ids apart from CSV-based ids and says that the time is UTC, not local.
+  `.csv.bak`, `.sync-conflict-...`), which is kept: the release has activities whose only
+  difference is that suffix, such as a backup version next to the regular one. Activities without
+  a CSV (manual entries, days off, ...) use their UTC start time followed by `Z`:
+  `2017_01_31_17_36_44Z`. The `Z` keeps these ids apart from CSV-based ids and says that the time
+  is UTC, not local.
+- Where two activities would still get the same id, the second gets `~2` (the third `~3`, ...).
+  This happens where an athlete's library held two versions of one activity, for example a file
+  imported twice: the release then has two rides with the same start time, and sometimes two
+  different CSVs under one name. Both versions are kept.
 - Tables with a key declare it; the validator checks that keys are unique and complete.
 
 ## Tables and layout
@@ -56,8 +66,18 @@ and `tools/validate.py` checks a built dataset against both.
 - **Time series** are Hive-partitioned by athlete, one file per athlete. `athlete_id` is also a
   column inside each file, so a single file is self-contained. Rows of one activity are
   contiguous and in recorded order, and activities appear in `activity_id` order.
+
+## Relations
+
 - Relations between tables (every `activities` row has an `athletes` row, every time series
   belongs to an activity, ...) are declared in `dataset.toml` and checked.
+- A dataset derived from another one declares relations to its tables as
+  `references = "<dataset>.<table>"`, for example `opendata.activities`: every activity in the
+  derived dataset exists in OpenData. When the relation is on the referenced table's whole key,
+  rows match one to one and the validator also checks that the shared columns both tables have
+  hold the same values. Validate with
+  `--against <the other dataset.toml> <its folder or hf://datasets/org/name>`; without it, these
+  relations fail rather than go unchecked.
 
 ## Time series values
 
@@ -112,21 +132,29 @@ and `tools/validate.py` checks a built dataset against both.
 
 ## Adding a dataset
 
+[`datasets/_template/`](datasets/_template/) is a small working dataset derived from OpenData (its
+activities with a time series, resampled to whole seconds); the tests build and validate it.
+
 1. Copy `datasets/_template/` to `datasets/<name>/` (or into your own repository) and describe the
-   dataset in its `dataset.toml`: tables, keys, columns, relations.
-2. Write the tables with `conventions.write_table`.
-3. Run `uv run tools/validate.py <dataset.toml> <built dataset folder>` until it passes.
+   dataset in its `dataset.toml`: tables, keys, columns, relations. Take `athlete_id` and
+   `activity_id` from OpenData's tables rather than deriving them again from the raw files.
+2. Build the tables with `conventions.write_table` (or `TableWriter`, to stream), and the card
+   from `README.md.tmpl` with `conventions.render_card`, as `build.py` does.
+3. Run `uv run tools/validate.py <dataset.toml> <built folder> --against
+   datasets/opendata/dataset.toml hf://datasets/GoldenCheetah/opendata` until it passes.
+4. After uploading, `uv run tools/smoke_test.py <dataset.toml> <org/name> --local <built folder>`
+   reads every table back through polars, DuckDB and `datasets`.
 
 ## Reference
 
 <!-- BEGIN GENERATED: conventions.py -->
 
-Conventions version **0.2**.
+Conventions version **0.3**.
 
 | column | type | unit | meaning |
 |---|---|---|---|
 | `athlete_id` | `string` |  | Anonymous athlete id (UUID) from the GoldenCheetah OpenData release; the name of the athlete's zip on OSF. Identical across datasets. |
-| `activity_id` | `string` |  | Activity id, unique within an athlete: the local start time `YYYY_MM_DD_HH_MM_SS` from the original CSV name, in a few cases followed by the original file's extension (`.fit`, `.pwx`, `.csv.bak`, ...). Activities without a CSV use their UTC start time followed by `Z`. Identical across datasets. |
+| `activity_id` | `string` |  | Activity id, unique within an athlete: the local start time `YYYY_MM_DD_HH_MM_SS` from the original CSV name, in a few cases followed by the original file's extension (`.fit`, `.pwx`, `.csv.bak`, ...). Activities without a CSV use their UTC start time followed by `Z`. Where two activities would get the same id (two versions of one activity in the release), the second gets `~2`. Identical across datasets. |
 | `time_s` | `float32` | s | Seconds since the start of the activity, as stored in this dataset. Fractional for devices that record at other intervals (e.g. 0.5 s, 1.26 s). A dataset that trims or resamples activities says so in its card; its `time_s` then need not match the raw data. |
 | `distance_m` | `float32` | m | Cumulative distance since the start of the activity. |
 | `power_w` | `float32` | W | Power. |

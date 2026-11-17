@@ -1,0 +1,74 @@
+# Template for a GoldenCheetah dataset on Hugging Face. Copy this folder to datasets/<name>/ (or
+# into your own repository), then replace the example below with your dataset.
+#
+# The example is a small dataset derived from opendata: activities that have a time series, with
+# the time series resampled to whole seconds. build.py builds it, and the tests build and validate
+# it, so everything here is known to work. See ../../CONVENTIONS.md for the rules.
+#
+# Shared columns (conventions.SHARED_COLUMNS) are listed by name only: their type, unit and
+# meaning come from the conventions. Other columns need a type and a description. Columns are
+# listed in file order.
+
+[dataset]
+name = "example"                              # lower snake_case; how other datasets refer to this one
+repo_id = "GoldenCheetah/example"             # the Hugging Face dataset repo
+pretty_name = "GoldenCheetah OpenData, resampled (example)"
+license = "cc0-1.0"
+conventions = "0.3"                           # the conventions version this dataset follows
+
+[tables.athletes]
+description = "One row per athlete with at least one activity in this dataset."
+key = ["athlete_id"]
+columns = [
+    { name = "athlete_id" },
+    { name = "gender" },
+    { name = "yob" },
+]
+
+[tables.activities]
+description = "One row per activity: the opendata activities that have a time series."
+default = true                                # the subset the Dataset Viewer opens
+key = ["athlete_id", "activity_id"]
+columns = [
+    { name = "athlete_id" },
+    { name = "activity_id" },
+    { name = "start_time_utc" },
+    { name = "sport" },
+    { name = "duration_s", type = "float32", unit = "s", required = true, description = "Length of the resampled time series: its number of samples." },
+]
+
+[tables.timeseries]
+description = "One row per second of each activity: the first sample recorded in that second, null where no sample was."
+profile = "timeseries"                        # the time series writer settings
+partition_by = "athlete_id"                   # one file per athlete
+key = []
+columns = [
+    { name = "athlete_id", required = true },
+    { name = "activity_id", required = true },
+    { name = "time_s", grid = 1.0 },          # a declared guarantee: the validator checks every value
+    { name = "power_w" },
+    { name = "hr_bpm" },
+]
+
+# Relations: every key in `table` exists in `references`. `<dataset>.<table>` is a table of another
+# dataset (validate with --against). When `on` is that table's whole key, the shared columns both
+# tables have must hold the same values: here start_time_utc and sport, gender and yob.
+[[relations]]
+table = "activities"
+references = "athletes"
+on = ["athlete_id"]
+
+[[relations]]
+table = "timeseries"
+references = "activities"
+on = ["athlete_id", "activity_id"]
+
+[[relations]]
+table = "activities"
+references = "opendata.activities"
+on = ["athlete_id", "activity_id"]
+
+[[relations]]
+table = "athletes"
+references = "opendata.athletes"
+on = ["athlete_id"]

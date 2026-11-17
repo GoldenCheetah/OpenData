@@ -5,6 +5,7 @@
 """Check a built dataset against its dataset.toml and the shared conventions.
 
     uv run tools/validate.py <dataset.toml> <dataset folder> [--jobs 8] [--max-files N]
+                             [--against <other dataset.toml> <its folder | hf://datasets/org/name>]
 
 The dataset folder is what gets uploaded to Hugging Face: README.md (the card) and data/.
 Exit code 0 when every check passes, 1 otherwise. Checks:
@@ -17,10 +18,13 @@ Exit code 0 when every check passes, 1 otherwise. Checks:
   values     required columns without nulls; id patterns; unique keys; time series partition value,
              activity order and contiguity; declared time_s guarantees (grid, monotonic)
   relations  every key referenced across tables exists (e.g. timeseries -> activities)
+  across     for relations to another dataset's tables (`references = "opendata.activities"`),
+             given with --against: every key exists there, and where rows match one to one,
+             the shared columns both tables have hold the same values
   card       README.md configs: one subset per table, the right files, the right default
 
 `--max-files N` checks only the first N files of each table (quick runs); relations are then
-checked only for the keys seen.
+not checked.
 """
 
 from __future__ import annotations
@@ -59,7 +63,7 @@ class Findings:
         if len(self.examples[k]) < MAX_EXAMPLES:
             self.examples[k].append(example)
 
-    def merge(self, other: "Findings") -> None:
+    def merge(self, other: Findings) -> None:
         for k, n in other.counts.items():
             self.counts[k] += n
             for e in other.examples[k]:
@@ -95,7 +99,9 @@ def check_file(path: Path, root: Path, ds: C.DatasetSpec, t: C.TableSpec,
     # schema: declared columns first, in order, then (if declared) a group of extra columns
     declared = [c.name for c in t.columns]
     if names[: len(declared)] != declared:
-        i = next((i for i, (a, b) in enumerate(zip(names, declared)) if a != b), min(len(names), len(declared)))
+        # first position where they differ (zip stops at the shorter list: the rest differs too)
+        i = next((i for i, (a, b) in enumerate(zip(names, declared, strict=False)) if a != b),
+                 min(len(names), len(declared)))
         f.add(t.name, "columns", f"{rel}: expected {declared[i:i + 3]}... at position {i}, found {names[i:i + 3]}...")
     for c in t.columns:
         if c.name in types and types[c.name] != c.type:
@@ -135,7 +141,8 @@ def check_file(path: Path, root: Path, ds: C.DatasetSpec, t: C.TableSpec,
     for rg in range(md.num_row_groups):
         g = md.row_group(rg)
         if profile.row_group_size and g.num_rows > profile.row_group_size:
-            f.add(t.name, "row group size", f"{rel}: row group {rg} has {g.num_rows:,} rows (max {profile.row_group_size:,})")
+            f.add(t.name, "row group size",
+                  f"{rel}: row group {rg} has {g.num_rows:,} rows (max {profile.row_group_size:,})")
         for ci in range(g.num_columns):
             col = g.column(ci)
             name = col.path_in_schema.split(".")[0]
@@ -183,13 +190,15 @@ def check_file(path: Path, root: Path, ds: C.DatasetSpec, t: C.TableSpec,
             if c.name in df.columns and (c.pattern or c.name == t.partition_by):
                 distinct[c.name] |= set(df[c.name].drop_nulls().unique().to_list())
         if t.partition_by and "activity_id" in df.columns and df.height:
-            r = df.select(pl.col("activity_id").filter(pl.col("activity_id") != pl.col("activity_id").shift(1).fill_null("")))
+            aid = pl.col("activity_id")
+            r = df.select(aid.filter(aid != aid.shift(1).fill_null("")))
             seq = r["activity_id"].to_list()
             if runs and seq and seq[0] == runs[-1]:
                 seq = seq[1:]                         # the same run continues across row groups
             runs += seq
         if time_checks and df.height:
-            ext = pl.concat([prev, df.select("activity_id", "time_s")]) if prev is not None else df.select("activity_id", "time_s")
+            cur = df.select("activity_id", "time_s")
+            ext = pl.concat([prev, cur]) if prev is not None else cur
             d = ext.with_columns(step=pl.col("time_s").diff().over("activity_id")).slice(0 if prev is None else 1)
             if time_col.grid:
                 g = time_col.grid
@@ -218,16 +227,19 @@ def check_file(path: Path, root: Path, ds: C.DatasetSpec, t: C.TableSpec,
     if t.partition_by and t.partition_by in distinct:
         expected = path.parent.name.split("=", 1)[1]
         if distinct[t.partition_by] != {expected}:
-            f.add(t.name, "partition value", f"{rel}: {t.partition_by} values {sorted(distinct[t.partition_by])[:3]} in folder {expected}")
+            values = sorted(distinct[t.partition_by])[:3]
+            f.add(t.name, "partition value", f"{rel}: {t.partition_by} values {values} in folder {expected}")
     if runs:
         if len(runs) != len(set(runs)):
             f.add(t.name, "activity rows not contiguous", f"{rel}: {len(runs) - len(set(runs))} activities split")
         elif runs != sorted(runs):
             f.add(t.name, "activity order", f"{rel}: activities not in activity_id order")
     if grid_off:
-        f.add(t.name, "time_s grid", f"{rel}: {grid_off:,} samples off the {time_col.grid} s grid, e.g. activity {time_example}", grid_off)
+        f.add(t.name, "time_s grid",
+              f"{rel}: {grid_off:,} samples off the {time_col.grid} s grid, e.g. activity {time_example}", grid_off)
     if backwards:
-        f.add(t.name, "time_s monotonic", f"{rel}: {backwards:,} non-increasing steps, e.g. activity {time_example}", backwards)
+        f.add(t.name, "time_s monotonic",
+              f"{rel}: {backwards:,} non-increasing steps, e.g. activity {time_example}", backwards)
 
     return FileResult(rel, md.num_rows, tuple(types.items()), f, keys, key_rows)
 
@@ -292,9 +304,58 @@ def check_card(root: Path, ds: C.DatasetSpec, f: Findings) -> None:
         f.add("card", "card configs", f"subset {name!r} has no table in dataset.toml")
 
 
-def validate(spec_path: Path, root: Path, jobs: int, max_files: int | None) -> int:
+def table_source(location: str | Path, t: C.TableSpec) -> str:
+    """Where a table's files are, for polars: in a local dataset folder or on the Hub (hf://...)."""
+    loc = str(location)
+    return f"{loc.rstrip('/')}/{t.glob}" if loc.startswith("hf://") else str(Path(loc) / t.glob)
+
+
+def check_other_dataset(r: C.Relation, t: C.TableSpec, root: Path, keys: set[tuple],
+                        other: tuple[C.DatasetSpec, str] | None, f: Findings) -> None:
+    """A relation to another dataset's table: keys exist there; one-to-one rows agree."""
+    check = f"relation -> {r.references}"
+    if other is None:
+        f.add(r.table, check, f"not checked: pass --against <{r.other_dataset} dataset.toml> <its folder or hf:// url>")
+        return
+    ospec, location = other
+    ot = ospec.tables.get(r.referenced_table)
+    if ot is None:
+        f.add(r.table, check, f"{ospec.name} has no table {r.referenced_table!r}")
+        return
+    ocols = {c.name for c in ot.columns}
+    if missing_cols := [c for c in r.on if c not in ocols]:
+        f.add(r.table, check, f"{r.references} has no column {missing_cols}")
+        return
+    on = list(r.on)
+    ref = pl.scan_parquet(table_source(location, ot), hive_partitioning=False).select(on).unique().collect()
+    missing = keys - set(ref.iter_rows())
+    if missing:
+        f.add(r.table, check, f"{len(missing):,} {r.on} values not in {r.references}, e.g. {sorted(missing)[0]}",
+              len(missing))
+    if set(on) != set(ot.key):
+        return  # rows don't match one to one: nothing to compare
+    shared = [c.name for c in t.columns if c.name in C.SHARED_COLUMNS and c.name in ocols and c.name not in on]
+    if not shared:
+        return
+    here = pl.scan_parquet(table_source(root, t), hive_partitioning=False).select(on + shared)
+    there = pl.scan_parquet(table_source(location, ot), hive_partitioning=False).select(on + shared)
+    j = here.join(there, on=on, how="inner", suffix="__other").collect()
+    for c in shared:
+        differ = j.filter(~pl.col(c).eq_missing(pl.col(f"{c}__other")))
+        if differ.height:
+            e = differ.row(0, named=True)
+            f.add(r.table, f"same values as {r.references}",
+                  f"{c} differs in {differ.height:,} rows, e.g. {dict((k, e[k]) for k in on)}: "
+                  f"{e[c]!r} here, {e[f'{c}__other']!r} in {ospec.name}", differ.height)
+
+
+def validate(spec_path: Path, root: Path, jobs: int, max_files: int | None,
+             against: dict[str, tuple[C.DatasetSpec, str]] | None = None) -> int:
+    """Check the dataset folder `root` against its dataset.toml. `against` maps the name of another
+    dataset that relations reference to (its spec, its folder or hf:// location)."""
     t0 = time.monotonic()
     ds = C.load_dataset_spec(spec_path)
+    against = against or {}
     findings = Findings()
 
     declared = set(ds.tables)
@@ -308,7 +369,8 @@ def validate(spec_path: Path, root: Path, jobs: int, max_files: int | None) -> i
     relation_cols: dict[str, set[tuple[str, ...]]] = defaultdict(set)
     for r in ds.relations:
         relation_cols[r.table].add(r.on)
-        relation_cols[r.references].add(r.on)
+        if not r.other_dataset:
+            relation_cols[r.references].add(r.on)
 
     keys: dict[str, dict[tuple[str, ...], set[tuple]]] = {}
     summary = []
@@ -334,20 +396,27 @@ def validate(spec_path: Path, root: Path, jobs: int, max_files: int | None) -> i
                         if row in seen_key_rows:
                             dup += 1
                             if dup <= MAX_EXAMPLES:
-                                findings.add(name, "duplicate keys", f"{dict(zip(t.key, row))}", 0)
+                                findings.add(name, "duplicate keys", f"{dict(zip(t.key, row, strict=True))}", 0)
                         seen_key_rows.add(row)
             if dup:
                 findings.counts[(name, "duplicate keys")] += dup
             if len(schemas) > 1:
                 variants = sorted(schemas.values(), key=len)
-                findings.add(name, "schema differs between files", f"{len(schemas)} variants, e.g. {variants[0][0]}", len(schemas) - 1)
+                findings.add(name, "schema differs between files",
+                             f"{len(schemas)} variants, e.g. {variants[0][0]}", len(schemas) - 1)
             keys[name] = table_keys
             summary.append((name, len(files), sum(r.rows for r in results)))
             print(f"  {name}: {len(files):,} files, {sum(r.rows for r in results):,} rows", file=sys.stderr)
 
     for r in ds.relations:
+        if max_files:
+            break
+        if r.other_dataset:
+            check_other_dataset(r, ds.tables[r.table], root, keys.get(r.table, {}).get(r.on, set()),
+                                against.get(r.other_dataset), findings)
+            continue
         missing = keys.get(r.table, {}).get(r.on, set()) - keys.get(r.references, {}).get(r.on, set())
-        if missing and not max_files:
+        if missing:
             ex_ = sorted(missing)[:MAX_EXAMPLES]
             findings.add(r.table, f"relation -> {r.references}",
                          f"{len(missing):,} {r.on} values not in {r.references}, e.g. {ex_[0]}", len(missing))
@@ -378,9 +447,16 @@ def main() -> None:
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="parallel processes (default: half the cores)")
     ap.add_argument("--max-files", type=int, help="check only the first N files of each table")
+    ap.add_argument("--against", nargs=2, action="append", default=[], metavar=("SPEC", "LOCATION"),
+                    help="another dataset that relations reference: its dataset.toml and its folder or "
+                         "hf://datasets/<org>/<name> (repeatable)")
     a = ap.parse_args()
     try:
-        sys.exit(validate(a.spec, a.root, a.jobs, a.max_files))
+        against = {}
+        for spec, location in a.against:
+            other = C.load_dataset_spec(Path(spec))
+            against[other.name] = (other, location)
+        sys.exit(validate(a.spec, a.root, a.jobs, a.max_files, against))
     except C.SpecError as e:
         sys.exit(f"invalid dataset.toml: {e}")
 

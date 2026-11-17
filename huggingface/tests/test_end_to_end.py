@@ -12,16 +12,7 @@ import pytest
 import conventions as C
 import migrate
 import validate
-from conftest import A1, A2, A3, basic_athlete, csv, make_zip, ride, write_workdir
-
-
-@pytest.fixture
-def built(tmp_path: Path, zips: Path) -> Path:
-    workdir = tmp_path / "work"
-    paths = [basic_athlete(zips, A1), basic_athlete(zips, A2), make_zip(zips / f"{A3}.zip", [], {})]
-    write_workdir(workdir, paths)
-    assert migrate.stage_convert(workdir, jobs=2, athletes=None, athletes_from=None, allow_errors=False) == 0
-    return workdir
+from conftest import A1, A2, A3, basic_athlete, make_zip, ride, write_workdir
 
 
 def test_convert_produces_a_dataset_that_passes_validation(built: Path):
@@ -89,7 +80,8 @@ def test_validator_catches_a_null_key(built: Path, tmp_path: Path):
     data = built / "build" / "opendata" / "data" / "activities"
     part = sorted(data.glob("*.parquet"))[0]
     df = pl.read_parquet(part)
-    df = df.with_columns(pl.when(pl.int_range(pl.len()) == 0).then(None).otherwise(pl.col("activity_id")).alias("activity_id"))
+    first_row = pl.int_range(pl.len()) == 0
+    df = df.with_columns(pl.when(first_row).then(None).otherwise(pl.col("activity_id")).alias("activity_id"))
     C.write_table(df.to_arrow(), part, "table", dataset="opendata", table_name="activities")
     assert validate.validate(migrate.SPEC_PATH, built / "build" / "opendata", jobs=1, max_files=None) == 1
 
@@ -120,8 +112,8 @@ def test_a_failed_write_leaves_no_file(tmp_path: Path):
 
 def test_a_json_problem_is_reported_before_anything_is_written(tmp_path: Path, zips: Path):
     workdir = tmp_path / "work"
-    dup = make_zip(zips / f"{A2}.zip", [ride("2019/03/02 07:00:00 UTC", metrics={"total_work": "1"}),
-                                        ride("2019/03/02 07:00:00 UTC", metrics={"total_work": "2"})], {})
+    # a metric value of a kind the converter doesn't know (an object) is only seen in the JSON pass
+    dup = make_zip(zips / f"{A2}.zip", [ride("2019/03/02 07:00:00 UTC", metrics={"total_work": {"x": 1}})], {})
     write_workdir(workdir, [basic_athlete(zips, A1), dup])
     assert migrate.stage_convert(workdir, jobs=1, athletes=None, athletes_from=None, allow_errors=False) == 1
     data = workdir / "build" / "opendata" / "data"

@@ -1,6 +1,6 @@
 ---
-license: cc0-1.0
-pretty_name: GoldenCheetah OpenData
+license: {{license}}
+pretty_name: {{pretty_name}}
 language:
 - en
 tags:
@@ -20,10 +20,10 @@ size_categories:
 {{configs}}
 ---
 
-# GoldenCheetah OpenData
+# {{pretty_name}}
 
 Anonymised training data shared by users of the [GoldenCheetah](https://www.goldencheetah.org)
-desktop application between 2018 and 2020: {{n_athletes}} athletes, {{n_activities}} activities,
+desktop application between {{first_upload_year}} and {{last_upload_year}}: {{n_athletes}} athletes, {{n_activities}} activities,
 ~{{n_rows}} samples (mostly one per second) of power, heart rate, cadence, speed/distance and altitude.
 
 This is a Parquet conversion of the original release on the Open Science Framework,
@@ -35,7 +35,7 @@ files can be recovered exactly (see *Exactness* below).
 
 | subset | rows | one row per | what |
 |---|---|---|---|
-| `activities` (default) | {{n_activities}} | activity | sport, start time, data-availability flags and ~380 GoldenCheetah metrics (TSS, NP, CP estimates, zones, mean-max power curve, ...) |
+| `activities` (default) | {{n_activities}} | activity | sport, start time, data-availability flags and {{n_metrics}} GoldenCheetah metrics (TSS, NP, CP estimates, zones, mean-max power curve, ...) |
 | `athletes` | {{n_athletes}} | athlete | gender, year of birth, counts, provenance (OSF file id + sha256 of the source zip) |
 | `timeseries` | ~{{n_rows}} | sample | `time_s, distance_m, power_w, hr_bpm, cadence_rpm, altitude_m` as recorded, mostly 1 Hz; one file per athlete |
 | `raw_json` | {{n_athletes}} | athlete | the original per-athlete JSON file, verbatim |
@@ -73,7 +73,7 @@ from datasets import load_dataset
 ds = load_dataset("{{repo_id}}", "timeseries", streaming=True)
 ```
 
-## Schema notes
+## Notes
 
 **timeseries**: `time_s` (seconds since start, the CSV `secs`; fractional for a few
 sub-second devices), `distance_m` (cumulative distance in metres; the CSV `km` × 1000),
@@ -100,11 +100,21 @@ matching it to the local-time CSV name. `sport` is free text as entered in Golde
 `C`adence, ...). Metric values given by GoldenCheetah as `[value, weight]` pairs are split into
 `<metric>` and `<metric>__weight`; array metrics (`power_mmp`, `*_dist`, `*_dist_bins`) are
 lists. `has_timeseries` is false for activities without samples (manual entries, days off, ...).
+An athlete's library sometimes held two versions of one activity (a file imported twice, say).
+Both are kept: two rows with the same `start_time_utc`, of which the one whose CSV is not in the
+release has a `Z` id and no samples; where both CSVs are in the release, the second is
+`<activity_id>~2`. A few athletes' JSON needed repairs to be read (`athletes.json_repairs`);
+`raw_json` has every JSON as it was released.
+
+## Data dictionary
+
+{{data_dictionary}}
 
 ## Provenance
 
 Converted from the {{n_athletes}} zips in OSF project 6hfpz (sha256 of every source zip in
-`athletes.osf_sha256`) with the scripts in {{code_url}} (converter {{converter_version}}, conventions {{conventions_version}}).
+`athletes.osf_sha256`) with the scripts in {{code_url}} (converter {{converter_version}}, conventions {{conventions_version}},
+{{libraries}}).
 
 ## Citation
 

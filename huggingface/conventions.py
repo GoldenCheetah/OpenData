@@ -31,7 +31,7 @@ from typing import Any
 
 # Version of these rules. Every dataset.toml names the version it follows; the validator applies
 # that version's rules. 0.x while nothing is published; 1.0 with the first public release.
-VERSION = "0.2"
+VERSION = "0.3"
 
 ROOT = Path(__file__).resolve().parent
 
@@ -41,7 +41,7 @@ ROOT = Path(__file__).resolve().parent
 # apart (string vs large_string, list vs large_list) count as the same type.
 TYPES = {
     "string", "bool", "uint8", "int16", "int32", "int64", "float32", "float64",
-    "timestamp[us, tz=UTC]", "list<float64>",
+    "timestamp[us, tz=UTC]", "list<float64>", "list<string>",
 }
 
 
@@ -70,6 +70,7 @@ def arrow_type(logical: str) -> Any:
         "string": pa.string(), "bool": pa.bool_(), "uint8": pa.uint8(), "int16": pa.int16(),
         "int32": pa.int32(), "int64": pa.int64(), "float32": pa.float32(), "float64": pa.float64(),
         "timestamp[us, tz=UTC]": pa.timestamp("us", tz="UTC"), "list<float64>": pa.list_(pa.float64()),
+        "list<string>": pa.list_(pa.string()),
     }
     return simple[logical]
 
@@ -86,9 +87,10 @@ class Column:
 
 ATHLETE_ID_RE = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 # Local start time from the activity's CSV name, sometimes followed by the original file's
-# extension(s) that GoldenCheetah kept (`.fit`, `.pwx`, `.csv.bak`, ...); or, for activities that
-# have no CSV, the UTC start time followed by `Z`.
-ACTIVITY_ID_RE = r"^\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}(Z|(\.[A-Za-z0-9]+)*)$"
+# extension(s) that GoldenCheetah kept (`.fit`, `.pwx`, `.csv.bak`, `.sync-conflict-...`); or, for
+# activities that have no CSV, the UTC start time followed by `Z`. Then `~n` (n >= 2) on the n-th
+# of activities that would otherwise share an id.
+ACTIVITY_ID_RE = r"^\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}(Z|(\.[A-Za-z0-9-]+)*)(~([2-9]|[1-9][0-9]+))?$"
 
 # A name in this registry means the same thing, with the same type and unit, in every dataset.
 # A dataset may leave a shared column out, but if it has a column with this name, it is this one.
@@ -101,7 +103,8 @@ SHARED_COLUMNS: dict[str, Column] = {c.name: c for c in [
            "Activity id, unique within an athlete: the local start time `YYYY_MM_DD_HH_MM_SS` from "
            "the original CSV name, in a few cases followed by the original file's extension "
            "(`.fit`, `.pwx`, `.csv.bak`, ...). Activities without a CSV use their UTC start time "
-           "followed by `Z`. Identical across datasets.",
+           "followed by `Z`. Where two activities would get the same id (two versions of one "
+           "activity in the release), the second gets `~2`. Identical across datasets.",
            ACTIVITY_ID_RE),
     # time series
     Column("time_s", "float32", "s",
@@ -286,7 +289,7 @@ class TableWriter:
         self.writer.close()
         self.tmp.unlink(missing_ok=True)
 
-    def __enter__(self) -> "TableWriter":
+    def __enter__(self) -> TableWriter:
         return self
 
     def __exit__(self, exc_type: Any, *exc: Any) -> None:
@@ -347,13 +350,35 @@ class TableSpec:
         """Declared per-column encoding overrides, for write_table."""
         return {c.name: c.encoding for c in self.columns if c.encoding}
 
+    def arrow_schema(self) -> Any:
+        """The declared columns as a pyarrow schema (extra columns are not declared one by one)."""
+        import pyarrow as pa
+
+        return pa.schema([(c.name, arrow_type(c.type)) for c in self.columns])
+
 
 @dataclass
 class Relation:
-    """Every key in `table` exists in `references` (e.g. timeseries -> activities)."""
+    """Every key in `table` exists in `references` (e.g. timeseries -> activities).
+
+    `references` is a table of this dataset, or `<dataset>.<table>` for a table of another
+    dataset (e.g. `opendata.activities`): a derived dataset's activities exist in the dataset it
+    derives from. When `on` is the referenced table's whole key, rows match one to one, and the
+    shared columns both tables have must also have equal values: same name, same meaning, same
+    value.
+    """
     table: str
     references: str
     on: tuple[str, ...]
+
+    @property
+    def other_dataset(self) -> str | None:
+        """The other dataset's name if `references` is in another dataset, else None."""
+        return self.references.split(".", 1)[0] if "." in self.references else None
+
+    @property
+    def referenced_table(self) -> str:
+        return self.references.rsplit(".", 1)[-1]
 
 
 @dataclass
@@ -365,6 +390,11 @@ class DatasetSpec:
     conventions: str
     tables: dict[str, TableSpec]
     relations: list[Relation] = field(default_factory=list)
+
+    @property
+    def other_datasets(self) -> list[str]:
+        """Datasets whose tables this one references (validate with --against)."""
+        return sorted({r.other_dataset for r in self.relations if r.other_dataset})
 
 
 class SpecError(ValueError):
@@ -403,7 +433,7 @@ def load_dataset_spec(path: Path) -> DatasetSpec:
                         errors.append(f"{where}.{name}: shared column; `{k}` comes from conventions.py")
                 grid = c.get("grid")
                 if grid is not None and (name != "time_s" or isinstance(grid, bool)
-                                         or not isinstance(grid, (int, float)) or grid <= 0):
+                                         or not isinstance(grid, int | float) or grid <= 0):
                     errors.append(f"{where}.{name}: `grid` is a positive number of seconds, on time_s only")
                 monotonic = c.get("monotonic", False)
                 if "monotonic" in c and (name != "time_s" or not isinstance(monotonic, bool)):
@@ -458,9 +488,20 @@ def load_dataset_spec(path: Path) -> DatasetSpec:
     relations = []
     for r in raw.get("relations", []):
         rel = Relation(r.get("table", ""), r.get("references", ""), tuple(r.get("on", ())))
-        for side in (rel.table, rel.references):
+        where = f"relation {rel.table} -> {rel.references}"
+        if not rel.on:
+            errors.append(f"{where}: needs `on` (the columns that link the tables)")
+        sides = [rel.table] if rel.other_dataset else [rel.table, rel.references]
+        if rel.other_dataset is not None:
+            if not re.match(NAME_RE, rel.other_dataset) or not re.match(NAME_RE, rel.referenced_table):
+                errors.append(f"{where}: another dataset's table is written `<dataset>.<table>`")
+            elif rel.other_dataset == ds.get("name"):
+                errors.append(f"{where}: a table of this dataset is referenced without the dataset name")
+        for side in sides:
             if side not in tables:
-                errors.append(f"relation {rel.table} -> {rel.references}: unknown table {side!r}")
+                errors.append(f"{where}: unknown table {side!r}")
+            elif missing := [c for c in rel.on if c not in {x.name for x in tables[side].columns}]:
+                errors.append(f"{where}: {side} has no column {missing}")
         relations.append(rel)
 
     if errors:
@@ -470,6 +511,66 @@ def load_dataset_spec(path: Path) -> DatasetSpec:
 
 
 # --- dataset card --------------------------------------------------------------------
+def data_dictionary(spec: DatasetSpec) -> str:
+    """The card's data dictionary: every table and column as dataset.toml declares it."""
+    def cell(s: str | None) -> str:
+        return (s or "").replace("|", "\\|").replace("\n", " ")
+
+    out: list[str] = []
+    for t in sorted(spec.tables.values(), key=lambda t: not t.default):
+        out += [f"### `{t.name}`", "", cell(t.description), ""]
+        key = f"key `({', '.join(t.key)})`" if t.key else "no key"
+        files = f"one file per `{t.partition_by}`: `{t.glob}`" if t.partition_by else f"`{t.glob}`"
+        out += [f"{key}; {files}", "", "| column | type | unit | description |", "|---|---|---|---|"]
+        for c in t.columns:
+            notes = []
+            if c.required and c.name not in t.key:
+                notes.append("Never null.")
+            if c.grid is not None:
+                notes.append(f"On a {c.grid:g} s grid: every value is a multiple of {c.grid:g}, and "
+                             f"consecutive samples of an activity are exactly {c.grid:g} s apart.")
+            elif c.monotonic:
+                notes.append("Strictly increasing within an activity.")
+            desc = " ".join([cell(c.description), *notes])
+            name = f"`{c.name}`" + (" ¹" if c.shared else "")
+            out.append(f"| {name} | `{c.type}` | {cell(c.unit)} | {desc} |")
+        if t.extra:
+            types = ", ".join(f"`{x}`" for x in t.extra.types)
+            out.append(f"| *other columns* | {types} | | {cell(t.extra.description)} |")
+        out.append("")
+    out.append("¹ Shared column: same name, type, unit and meaning in every GoldenCheetah dataset on "
+               "Hugging Face ([conventions](https://github.com/GoldenCheetah/OpenData/blob/master/huggingface/CONVENTIONS.md)).")
+    return "\n".join(out)
+
+
+PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")
+
+
+def render_card(template: str, spec: DatasetSpec, values: dict[str, str]) -> str:
+    """A dataset card from its template: `{{name}}` placeholders filled from dataset.toml
+    (repo_id, pretty_name, license, configs, data_dictionary, conventions_version) and `values`.
+    Every placeholder must be filled and every value used, so card and template can't drift."""
+    filled = {"repo_id": spec.repo_id, "pretty_name": spec.pretty_name, "license": spec.license,
+              "configs": card_configs(spec), "data_dictionary": data_dictionary(spec),
+              "conventions_version": VERSION, **values}
+    used = set(PLACEHOLDER_RE.findall(template))
+    if missing := sorted(used - filled.keys()):
+        raise ValueError(f"card template has placeholders without a value: {missing}")
+    if unused := sorted(set(values) - used):
+        raise ValueError(f"values the card template doesn't use: {unused}")
+    return PLACEHOLDER_RE.sub(lambda m: filled[m.group(1)], template)
+
+
+SIZE_CATEGORIES = [(10**3, "n<1K"), (10**4, "1K<n<10K"), (10**5, "10K<n<100K"), (10**6, "100K<n<1M"),
+                   (10**7, "1M<n<10M"), (10**8, "10M<n<100M"), (10**9, "100M<n<1B"), (10**10, "1B<n<10B"),
+                   (10**11, "10B<n<100B")]
+
+
+def size_category(n_rows: int) -> str:
+    """Hugging Face's `size_categories` value for a dataset of n_rows (its largest table)."""
+    return next((c for limit, c in SIZE_CATEGORIES if n_rows < limit), "n>100B")
+
+
 def card_configs(spec: DatasetSpec) -> str:
     """The card's YAML `configs`: one subset per table, default table first."""
     tables = sorted(spec.tables.values(), key=lambda t: not t.default)

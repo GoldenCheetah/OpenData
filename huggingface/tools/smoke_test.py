@@ -55,8 +55,9 @@ def main() -> int:
 
     import duckdb
     import polars as pl
-    from datasets import load_dataset
     from huggingface_hub import get_token
+
+    from datasets import load_dataset
 
     spec = C.load_dataset_spec(a.spec)
     con = duckdb.connect()

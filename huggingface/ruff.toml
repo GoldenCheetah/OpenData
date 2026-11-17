@@ -1,0 +1,11 @@
+# Lint settings for everything under huggingface/ except research/ (frozen evidence).
+# Run: uvx ruff check   (CI runs it too)
+line-length = 120
+target-version = "py311"
+extend-exclude = ["research"]
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[lint.isort]
+known-first-party = ["conventions", "gcod", "migrate", "validate", "conftest"]

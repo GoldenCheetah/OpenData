@@ -1,0 +1,45 @@
+---
+license: {{license}}
+pretty_name: {{pretty_name}}
+tags:
+- sports
+- cycling
+- time-series
+size_categories:
+- {{size_category}}
+{{configs}}
+---
+
+# {{pretty_name}}
+
+<!-- What this dataset is, who made it and why, in two or three sentences. -->
+An example of a dataset derived from [GoldenCheetah OpenData](https://huggingface.co/datasets/GoldenCheetah/opendata):
+the {{n_activities}} activities of {{n_athletes}} athletes that have a time series, resampled to
+one row per second.
+
+It follows the [GoldenCheetah dataset conventions](https://github.com/GoldenCheetah/OpenData/blob/master/huggingface/CONVENTIONS.md):
+`athlete_id` and `activity_id` are those of OpenData, so the tables join directly to it, and
+shared columns (`power_w`, `hr_bpm`, ...) have the same name, type, unit and meaning there.
+
+## Usage
+
+```python
+import polars as pl
+
+acts = pl.read_parquet("hf://datasets/{{repo_id}}/data/activities/*.parquet")
+ts = pl.scan_parquet("hf://datasets/{{repo_id}}/data/timeseries/*/*.parquet")
+```
+
+## Data dictionary
+
+{{data_dictionary}}
+
+## Provenance
+
+<!-- What the data was derived from, how, and with which code (link to it and its version). -->
+Built with `datasets/_template/build.py` from OpenData, conventions {{conventions_version}}.
+
+## License
+
+<!-- The license, and that of the data it is derived from. -->
+CC0 1.0, same as GoldenCheetah OpenData.
