@@ -3,7 +3,9 @@
 The exploration that the design in `CONVENTIONS.md` and `datasets/opendata/` is based on: one
 question per script, each writing a report to `reports/`. Kept as evidence and frozen; production
 code does not import from here (`lib/` is a snapshot of what became `datasets/opendata/`). The
-exception is `13_quirk_census.py`, which runs the production converter over the full release.
+exceptions are `13_quirk_census.py`, which runs the production converter over the full release, and
+`14_hub_layouts.py`, which repacks its output into candidate time series layouts and benchmarks them
+on the Hub.
 
 Every script is a standalone [PEP 723](https://peps.python.org/pep-0723/) script with inline
 dependencies. Run them from `huggingface/` with `uv run <script>`; no virtualenv or
@@ -26,7 +28,8 @@ research/
 │   ├── 09_precision_census.py      significant digits of every CSV value; float32 round trip
 │   ├── 10_benchmark_columns.py     per-column representations (f64/f32/metres/int units)
 │   ├── 11_benchmark_distance_delta.py  cumulative vs per-sample distance
-│   └── 13_quirk_census.py          every quirk in all 6,613 zips, with the production converter
+│   ├── 13_quirk_census.py          every quirk in all 6,613 zips, with the production converter
+│   └── 14_hub_layouts.py           time series layouts on the Hub: files × row groups × readers
 ├── share/
 │   └── gcod_parquet.py             self-contained script for collaborators: raw zip → opendata
 │                                   layout, with an exactness check
@@ -49,4 +52,7 @@ uv run research/explore/01_osf_listing.py
 uv run research/explore/02_download_sample.py          # ~3 GB, ~1 MB/s from OSF
 for s in 03 04 05 06 07 08 09 10 11; do uv run research/explore/${s}_*.py; done
 uv run datasets/opendata/migrate.py mirror && uv run research/explore/13_quirk_census.py   # full release
+# after `migrate.py convert`; upload needs write access to a scratch dataset repo
+uv run research/explore/14_hub_layouts.py build && uv run research/explore/14_hub_layouts.py upload --repo <repo>
+uv run research/explore/14_hub_layouts.py bench --repo <repo> && uv run research/explore/14_hub_layouts.py report
 ```
