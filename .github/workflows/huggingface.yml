@@ -1,0 +1,34 @@
+name: huggingface
+
+on:
+  push:
+    branches: [master]
+    paths: ["huggingface/**", ".github/workflows/huggingface.yml"]
+  pull_request:
+    paths: ["huggingface/**", ".github/workflows/huggingface.yml"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: huggingface
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]   # the oldest supported (requires-python) and the newest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Lint
+        run: uvx ruff@0.8.6 check
+      - name: Generated docs are up to date
+        run: uv run conventions.py --check-docs
+      - name: Tests
+        run: uv run --with-requirements tests/requirements.txt pytest tests -q

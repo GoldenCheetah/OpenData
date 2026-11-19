@@ -1,0 +1,6 @@
+data/
+__pycache__/
+*.pyc
+PLAN.md
+research/reports/12*
+research/explore/12*

@@ -1,0 +1,147 @@
+---
+license: {{license}}
+pretty_name: {{pretty_name}}
+language:
+- en
+tags:
+- sports
+- cycling
+- running
+- endurance
+- power-meter
+- heart-rate
+- time-series
+- physiology
+task_categories:
+- time-series-forecasting
+- tabular-regression
+size_categories:
+- {{size_category}}
+{{configs}}
+---
+
+# {{pretty_name}}
+
+Anonymised training data shared by users of the [GoldenCheetah](https://www.goldencheetah.org)
+desktop application between {{first_upload_year}} and {{last_upload_year}}: {{n_athletes}} athletes, {{n_activities}} activities,
+~{{n_rows}} samples (mostly one per second) of power, heart rate, cadence, speed/distance and altitude.
+
+This is a Parquet conversion of the original release on the Open Science Framework,
+[osf.io/6hfpz](https://osf.io/6hfpz/) (DOI [10.17605/OSF.IO/6HFPZ](https://doi.org/10.17605/OSF.IO/6HFPZ)).
+No records were removed and no information was lost: every value in the original CSV and JSON
+files can be recovered exactly (see *Exactness* below).
+
+## Subsets
+
+| subset | rows | one row per | what |
+|---|---|---|---|
+| `activities` (default) | {{n_activities}} | activity | sport, start time, data-availability flags and {{n_metrics}} GoldenCheetah metrics (TSS, NP, CP estimates, zones, mean-max power curve, ...) |
+| `athletes` | {{n_athletes}} | athlete | gender, year of birth, counts, provenance (OSF file id + sha256 of the source zip) |
+| `timeseries` | ~{{n_rows}} | sample | `time_s, distance_m, power_w, hr_bpm, cadence_rpm, altitude_m` as recorded, mostly 1 Hz; sorted by athlete |
+| `raw_json` | {{n_athletes}} | athlete | the original per-athlete JSON file, verbatim |
+| `timeseries_exceptions` | tiny | value | the few source values outside the Float32 range (see below) |
+
+Join keys: `athlete_id` (UUID, identical to the OSF zip name) and `activity_id`
+(the original CSV name without `.csv`, i.e. the *local* start time `YYYY_MM_DD_HH_MM_SS`;
+activities without a CSV use their UTC start time followed by `Z`). Other GoldenCheetah
+datasets on Hugging Face use the same keys, so they join directly to `activities` and `timeseries` here.
+
+## Usage
+
+```python
+import polars as pl   # pip install "polars[rt64]": the time series has more rows than standard polars allows
+
+ts = pl.scan_parquet("hf://datasets/{{repo_id}}/data/timeseries/*.parquet")
+
+# one athlete, or one activity: reads only the row groups that hold it (seconds)
+athlete = ts.filter(pl.col("athlete_id") == "{{example_athlete_id}}").collect()
+ride = ts.filter((pl.col("athlete_id") == "{{example_athlete_id}}")
+                 & (pl.col("activity_id") == "{{example_activity_id}}")).collect()
+
+acts = pl.read_parquet("hf://datasets/{{repo_id}}/data/activities/*.parquet",
+                       columns=["athlete_id", "activity_id", "sport", "start_time_utc", "coggan_tss"])
+```
+
+```sql
+-- DuckDB
+SELECT sport, count(*) FROM 'hf://datasets/{{repo_id}}/data/activities/*.parquet' GROUP BY ALL;
+SELECT * FROM 'hf://datasets/{{repo_id}}/data/timeseries/*.parquet'
+WHERE athlete_id = '{{example_athlete_id}}';
+```
+
+```python
+from datasets import load_dataset
+ds = load_dataset("{{repo_id}}", "timeseries", streaming=True)
+```
+
+**Whole-table analyses of the time series: download it first** ({{timeseries_size}}). Reading
+all of it over HTTP takes one request per row group and column, and the Hub limits requests
+per IP (fewer when not logged in), so such queries get cut off. Locally, the same code runs on
+`data/timeseries/*.parquet`:
+
+```bash
+hf download {{repo_id}} --repo-type dataset --include "data/timeseries/*" --local-dir opendata
+```
+
+## Notes
+
+**timeseries**: `time_s` (seconds since start, the CSV `secs`; fractional for a few
+sub-second devices), `distance_m` (cumulative distance in metres; the CSV `km` × 1000),
+`power_w` (CSV `power`), `hr_bpm` (CSV `hr`), `cadence_rpm` (CSV `cad`), `altitude_m` (CSV `alt`).
+Column names carry their unit and are shared across the GoldenCheetah datasets on Hugging Face.
+Files `timeseries/part-00000.parquet`, ... of about 500 MB, sorted by `athlete_id`; each athlete
+is in one file. Missing sensor = null. Rows are as recorded:
+gaps (auto-pause, smart recording) are **not** filled. Rows of one activity are contiguous and
+in recorded order, which is not always `time_s` order: `time_s` repeats now and then, and in a
+very few broken recordings it jumps backwards while distance shows the rows are in order.
+
+*Exactness.* GoldenCheetah exported every number with 6 significant digits. Float32 holds any
+6-significant-digit decimal exactly, so the columns are Float32 and nothing is rounded:
+formatting a value with `%.6g` gives back the number in the original CSV (for `distance_m`:
+the original `km` with the decimal point moved). Casting to Float64 shows binary noise in the
+8th digit (`72.5636` → `72.56359863`); round to 6 significant digits if you need the exact
+decimal. The handful of source values that lie outside the Float32 range (sub-normal junk such
+as `4.94066e-324`, written as `0` here) are listed with their exact Float64 value in
+`timeseries_exceptions` (`athlete_id, activity_id, row_in_activity, column, source_value`).
+
+**activities**: `start_time_utc` comes from the JSON; `utc_offset_minutes` is derived by
+matching it to the local-time CSV name. `sport` is free text as entered in GoldenCheetah
+(`Bike`, `bike`, `Rennrad`, `VirtualRide`, empty, ...). `data_flags` is GoldenCheetah's
+15-character availability string (`T`ime, `D`istance, `S`peed, `P`ower, `H`eart rate,
+`C`adence, ...). Metric values given by GoldenCheetah as `[value, weight]` pairs are split into
+`<metric>` and `<metric>__weight`; array metrics (`power_mmp`, `*_dist`, `*_dist_bins`) are
+lists. `has_timeseries` is false for activities without samples (manual entries, days off, ...).
+An athlete's library sometimes held two versions of one activity (a file imported twice, say).
+Both are kept: two rows with the same `start_time_utc`, of which the one whose CSV is not in the
+release has a `Z` id and no samples; where both CSVs are in the release, the second is
+`<activity_id>~2`. A few athletes' JSON needed repairs to be read (`athletes.json_repairs`);
+`raw_json` has every JSON as it was released.
+
+## Data dictionary
+
+{{data_dictionary}}
+
+## Provenance
+
+Converted from the {{n_athletes}} zips in OSF project 6hfpz (sha256 of every source zip in
+`athletes.osf_sha256`) with the scripts in {{code_url}} (converter {{converter_version}}, conventions {{conventions_version}},
+{{libraries}}).
+
+## Citation
+
+Please cite the original dataset:
+
+```bibtex
+@misc{gcod2018,
+  title     = {GoldenCheetah OpenData Project},
+  author    = {Liversedge, Mark},
+  year      = {2018},
+  publisher = {Open Science Framework},
+  doi       = {10.17605/OSF.IO/6HFPZ},
+  url       = {https://osf.io/6hfpz/}
+}
+```
+
+## License
+
+[CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/), same as the original release.
