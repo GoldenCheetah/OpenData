@@ -55,7 +55,7 @@ and `tools/validate.py` checks a built dataset against both.
 ├── README.md                                   dataset card
 └── data/
     ├── <table>/*.parquet                       one folder per table
-    └── timeseries/athlete_id=<uuid>/part.parquet   time series: one file per athlete
+    └── timeseries/part-00000.parquet, ...      time series: ~500 MB files, sorted by athlete
 ```
 
 - Every table is a folder under `data/` and a subset (`configs` entry) of the dataset card, so
@@ -63,9 +63,18 @@ and `tools/validate.py` checks a built dataset against both.
   every dataset. A new table is a new folder and does not affect existing ones.
 - `athletes`, `activities` and `timeseries` have a fixed meaning ([reference](#reference)).
   Datasets name other tables freely.
-- **Time series** are Hive-partitioned by athlete, one file per athlete. `athlete_id` is also a
-  column inside each file, so a single file is self-contained. Rows of one activity are
-  contiguous and in recorded order, and activities appear in `activity_id` order.
+- **Time series** are sorted by athlete and split into part files of about 500 MB
+  (`part-00000.parquet`, `part-00001.parquet`, ...); each athlete is in one file. Rows of one
+  activity are contiguous and in recorded order, and activities appear in `activity_id` order.
+  Readers find one athlete or activity through the row groups' statistics and read only those
+  row groups. Write with `conventions.PartWriter`, which follows these rules; in `dataset.toml`
+  the table declares `cluster_by = "athlete_id"`.
+- Why few large files: the Hub limits requests per IP and 5 minutes (anonymous: 3,000 file
+  reads, 500 listings), and reading a file or a row group of it is a request. With one file per
+  athlete, a query over all athletes runs out before it starts; with ~100 files, polars, DuckDB,
+  pandas and `datasets` read one athlete in seconds, and the Dataset Viewer works fully. Analyses
+  of a whole large table are meant to run on a downloaded copy. Measurements:
+  `research/reports/14_hub_layouts.md`.
 
 ## Relations
 
@@ -104,14 +113,14 @@ and `tools/validate.py` checks a built dataset against both.
 
 ## Parquet files
 
-- Written with `conventions.write_table`, which applies the settings below, records the dataset,
-  table and conventions version in each file's metadata (key `goldencheetah`), and writes
-  atomically.
+- Written with `conventions.write_table` (or `TableWriter`, `PartWriter` for large tables), which
+  applies the settings below, records the dataset, table and conventions version in each file's
+  metadata (key `goldencheetah`), and writes atomically.
 - All files use zstd, content-defined chunking (a new release uploads only changed data) and a page
   index (fast filtered and streamed reads), as Hugging Face recommends.
 - Time series use the `timeseries` profile: byte-stream-split encoding for floats, dictionary
-  encoding for ids, zstd level 15, 256k-row (~2 MB) row groups. The measurements behind these
-  choices are in `research/reports/05`, `06`, `09` and `10`.
+  encoding for ids, zstd level 15, 1M-row (~3.5 MB) row groups. The measurements behind these
+  choices are in `research/reports/05`, `06`, `09`, `10` and `14`.
 - Encoding only affects size, never what readers get. A column that compresses better another way
   (say, a derived float with few distinct values, which suits a dictionary) declares
   `encoding = "dictionary"` in `dataset.toml`; `write_table` applies it and the validator checks it.
@@ -149,7 +158,7 @@ activities with a time series, resampled to whole seconds); the tests build and 
 
 <!-- BEGIN GENERATED: conventions.py -->
 
-Conventions version **0.3**.
+Conventions version **0.4**.
 
 | column | type | unit | meaning |
 |---|---|---|---|
@@ -171,11 +180,11 @@ Conventions version **0.3**.
 |---|---|
 | `athletes` | One row per athlete; key `athlete_id`. |
 | `activities` | One row per activity; key `(athlete_id, activity_id)`. |
-| `timeseries` | One row per sample. One file per athlete: `data/timeseries/athlete_id=<uuid>/part.parquet`. Rows of an activity are contiguous and in recorded order, activities in `activity_id` order. |
+| `timeseries` | One row per sample, sorted by `athlete_id`, each athlete in one file: `data/timeseries/part-00000.parquet`, ... of about 500 MB. Rows of an activity are contiguous and in recorded order, activities in `activity_id` order. |
 
 | writer profile | compression | row group | byte stream split | dictionary |
 |---|---|---|---|---|
-| `timeseries` | zstd 15 | 256000 | float32, float64 | strings |
+| `timeseries` | zstd 15 | 1000000 | float32, float64 | strings |
 | `table` | zstd 9 | 100000 | - | all |
 
 <!-- END GENERATED -->

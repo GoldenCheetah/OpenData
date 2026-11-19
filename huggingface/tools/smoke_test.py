@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["datasets>=4", "duckdb>=1.1", "huggingface_hub>=2.4", "httpx>=0.27", "polars>=1.20", "pyarrow>=21"]
+# dependencies = ["datasets>=4", "duckdb>=1.1", "huggingface_hub>=2.4", "httpx>=0.27", "polars[rt64]>=1.33",
+#                 "pyarrow>=21"]
 # ///
 """Read a dataset on the Hugging Face Hub the way its users will, and check what comes back.
 
@@ -12,8 +13,12 @@ For every table in dataset.toml, through each of the three ways the cards show:
   duckdb     SELECT ... FROM 'hf://datasets/<repo>/<files>': columns, the row count
   datasets   load_dataset(<repo>, <subset>, streaming=True): columns of the first row
 
+For clustered tables (the time series), polars and DuckDB also read the rows of one athlete,
+the way the cards show: filtered on athlete_id, over all files.
+
 Columns must be the declared ones, in order (extra columns follow them), and the row counts of
 polars and DuckDB must agree, with each other and with --local (the folder that was uploaded).
+Counting a large table's rows reads only file footers, so it stays within the Hub's rate limits.
 Also reports the Dataset Viewer status (informational: private repos may not have one).
 Uses the token of `hf auth login`, so private repos work. Exit code 0 when everything passes.
 """
@@ -21,6 +26,7 @@ Uses the token of `hf auth login`, so private repos work. Exit code 0 when every
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -40,10 +46,14 @@ def columns_problem(got: list[str], t: C.TableSpec) -> str | None:
     return None
 
 
-def local_rows(folder: Path, t: C.TableSpec) -> int:
-    import pyarrow.parquet as pq
+def local_rows(folder: Path, t: C.TableSpec, value: str | None = None) -> int:
+    """Rows of a table in the local folder; with `value`, only those of that cluster value."""
+    import polars as pl
 
-    return sum(pq.ParquetFile(p).metadata.num_rows for p in sorted(folder.glob(t.glob)))
+    lf = pl.scan_parquet(folder / t.glob)
+    if value is not None:
+        lf = lf.filter(pl.col(t.cluster_by) == value)
+    return lf.select(pl.len()).collect().item()
 
 
 def main() -> int:
@@ -73,6 +83,8 @@ def main() -> int:
         url = f"hf://datasets/{a.repo_id}/{t.glob}"
         print(f"{name}  ({url})")
         counts: dict[str, int] = {}
+        one: dict[str, int] = {}  # rows of one cluster value (clustered tables)
+        value = None
 
         t0 = time.monotonic()
         try:
@@ -84,6 +96,12 @@ def main() -> int:
             counts["polars"] = lf.select(pl.len()).collect().item()
             print(f"    polars    {counts['polars']:>15,} rows, {len(cols)} columns, head {head.shape} "
                   f"({time.monotonic() - t0:.0f} s)")
+            if t.cluster_by and head.height:
+                value = head[t.cluster_by][0]
+                t0 = time.monotonic()
+                one["polars"] = lf.filter(pl.col(t.cluster_by) == value).select(pl.len()).collect().item()
+                print(f"    polars    {one['polars']:>15,} rows of {t.cluster_by} {value} "
+                      f"({time.monotonic() - t0:.0f} s)")
         except Exception as e:  # noqa: BLE001 - report and go on with the other readers
             fail(name, "polars", f"{type(e).__name__}: {e}")
 
@@ -94,6 +112,12 @@ def main() -> int:
                 fail(name, "duckdb", p)
             counts["duckdb"] = con.execute(f"SELECT count(*) FROM '{url}'").fetchone()[0]
             print(f"    duckdb    {counts['duckdb']:>15,} rows, {len(cols)} columns ({time.monotonic() - t0:.0f} s)")
+            if value is not None:
+                t0 = time.monotonic()
+                one["duckdb"] = con.execute(f"SELECT count(*) FROM '{url}' WHERE {t.cluster_by} = ?",
+                                            [value]).fetchone()[0]
+                print(f"    duckdb    {one['duckdb']:>15,} rows of {t.cluster_by} {value} "
+                      f"({time.monotonic() - t0:.0f} s)")
         except Exception as e:  # noqa: BLE001
             fail(name, "duckdb", f"{type(e).__name__}: {e}")
 
@@ -109,8 +133,12 @@ def main() -> int:
 
         if a.local:
             counts["local"] = local_rows(a.local, t)
+            if value is not None:
+                one["local"] = local_rows(a.local, t, value)
         if len(set(counts.values())) > 1:
             fail(name, "rows", f"row counts differ: {counts}")
+        if len(set(one.values())) > 1:
+            fail(name, "rows", f"row counts of {t.cluster_by} {value} differ: {one}")
 
     try:
         import httpx
@@ -128,4 +156,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    sys.stdout.flush()
+    # A `datasets` stream stopped early can hang at interpreter exit (its prefetch threads):
+    # everything is done and reported here, so exit without waiting for them.
+    os._exit(code)

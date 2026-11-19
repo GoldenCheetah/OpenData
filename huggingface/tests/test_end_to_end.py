@@ -28,12 +28,15 @@ def test_tables_have_the_expected_content(built: Path):
     data = built / "build" / "opendata" / "data"
     athletes = pl.read_parquet(data / "athletes" / "*.parquet")
     acts = pl.read_parquet(data / "activities" / "*.parquet")
-    ts = pl.read_parquet(data / "timeseries" / "*" / "*.parquet", hive_partitioning=False)
+    ts = pl.read_parquet(data / "timeseries" / "*.parquet")
     exc = pl.read_parquet(data / "timeseries_exceptions" / "*.parquet")
     assert athletes.height == 3                                    # including the empty athlete
     assert athletes.filter(pl.col("athlete_id") == A3)["n_activities"].item() == 0
     assert acts.height == 8 and ts.height == 12 and exc.height == 2
-    assert not (data / "timeseries" / f"athlete_id={A3}").exists()  # no samples, no file
+    # one part file per athlete with samples (1-byte parts in the fixture), sorted by athlete
+    parts = sorted((data / "timeseries").iterdir())
+    assert [p.name for p in parts] == ["part-00000.parquet", "part-00001.parquet"]
+    assert [pl.read_parquet(p)["athlete_id"].unique().to_list() for p in parts] == [[A1], [A2]]
     assert (built / "build" / "opendata" / "README.md").exists()
 
 
@@ -43,6 +46,32 @@ def test_converting_again_changes_nothing(built: Path):
     assert migrate.stage_convert(built, jobs=2, athletes=None, athletes_from=None, allow_errors=False) == 0
     after = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in repo.rglob("*.parquet")}
     assert before == after
+
+
+def test_part_files_hold_several_athletes_up_to_the_target_size(built: Path, monkeypatch):
+    monkeypatch.setattr(C, "PART_BYTES", 10**9)
+    assert migrate.stage_convert(built, jobs=1, athletes=None, athletes_from=None, allow_errors=False) == 0
+    data = built / "build" / "opendata" / "data" / "timeseries"
+    assert [p.name for p in data.iterdir()] == ["part-00000.parquet"]
+    assert pl.read_parquet(data / "part-00000.parquet")["athlete_id"].unique(maintain_order=True).to_list() == [A1, A2]
+    assert migrate.stage_check(built, jobs=1, text_fraction=1.0, seed=0) == 0
+
+
+def test_an_interrupted_packing_resumes_with_the_files_it_has_not_finished(built: Path, capsys):
+    b = migrate.Build(built)
+    final, tmp = b.repo / "data" / "timeseries", b.repo / "data" / "timeseries.tmp"
+    final.rename(tmp)  # as if stopped after both part files were written, before the swap
+    (tmp / "part-00001.parquet").unlink()
+    (tmp / "part-00002.parquet.tmp").write_bytes(b"half written")
+    assert migrate.pack_timeseries(b, [A1, A2], jobs=1) == 0
+    assert "2 part files (1 already done)" in capsys.readouterr().out
+    assert not tmp.exists() and sorted(p.name for p in final.iterdir()) == ["part-00000.parquet", "part-00001.parquet"]
+    assert migrate.stage_check(built, jobs=1, text_fraction=0.0, seed=0) == 0
+
+
+def test_packing_is_skipped_when_nothing_changed(built: Path, capsys):
+    assert migrate.pack_timeseries(migrate.Build(built), [A1, A2], jobs=1) == 0
+    assert "2 part files up to date" in capsys.readouterr().out
 
 
 def test_athletes_converted_by_an_older_converter_are_converted_again(built: Path, capsys):
@@ -68,8 +97,8 @@ def test_an_unknown_quirk_stops_before_the_metadata_tables(tmp_path: Path, zips:
 
 
 def test_check_notices_a_tampered_time_series_file(built: Path):
-    path = built / "build" / "opendata" / "data" / "timeseries" / f"athlete_id={A1}" / "part.parquet"
-    df = pl.read_parquet(path, hive_partitioning=False)
+    path = built / "build" / "opendata" / "data" / "timeseries" / "part-00000.parquet"
+    df = pl.read_parquet(path)
     df = df.with_columns(pl.when(pl.int_range(pl.len()) == 0).then(999.0).otherwise(pl.col("power_w"))
                          .cast(pl.Float32).alias("power_w"))
     C.write_table(df.to_arrow(), path, "timeseries", dataset="opendata", table_name="timeseries")
@@ -84,6 +113,63 @@ def test_validator_catches_a_null_key(built: Path, tmp_path: Path):
     df = df.with_columns(pl.when(first_row).then(None).otherwise(pl.col("activity_id")).alias("activity_id"))
     C.write_table(df.to_arrow(), part, "table", dataset="opendata", table_name="activities")
     assert validate.validate(migrate.SPEC_PATH, built / "build" / "opendata", jobs=1, max_files=None) == 1
+
+
+def test_validator_catches_athletes_out_of_order_across_part_files(built: Path, capsys):
+    data = built / "build" / "opendata" / "data" / "timeseries"
+    a, b = data / "part-00000.parquet", data / "part-00001.parquet"
+    a.rename(data / "x")
+    b.rename(a)
+    (data / "x").rename(b)
+    assert validate.validate(migrate.SPEC_PATH, built / "build" / "opendata", jobs=1, max_files=None) == 1
+    assert "is not after" in capsys.readouterr().out
+
+
+def test_validator_catches_an_athlete_split_inside_a_file(built: Path, capsys):
+    data = built / "build" / "opendata" / "data" / "timeseries"
+    df = pl.read_parquet(data / "part-00000.parquet")
+    other = df.with_columns(pl.lit(A2).alias("athlete_id"))
+    mixed = pl.concat([df.head(2), other, df.slice(2)])  # A1, A2, A1
+    C.write_table(mixed.to_arrow(), data / "part-00000.parquet", "timeseries", dataset="opendata",
+                  table_name="timeseries")
+    assert validate.validate(migrate.SPEC_PATH, built / "build" / "opendata", jobs=1, max_files=None) == 1
+    assert "runs of athlete_id and activity_id split" in capsys.readouterr().out
+
+
+def test_part_writer_starts_a_new_file_only_between_values(tmp_path: Path):
+    import pyarrow as pa
+
+    def rows(athlete: str, n: int) -> pa.Table:
+        return pa.table({"athlete_id": [athlete] * n, "x": pa.array(range(n), pa.float32())})
+
+    with C.PartWriter(tmp_path, rows(A1, 1).schema, "table", "athlete_id", dataset="t", table_name="t",
+                      target=1) as w:
+        for piece in [rows(A1, 3), rows(A1, 200_000), rows(A2, 5), rows(A3, 1)]:
+            w.write(piece)
+    files = sorted(tmp_path.iterdir())
+    assert [p.name for p in files] == ["part-00000.parquet", "part-00001.parquet", "part-00002.parquet"]
+    assert [pl.read_parquet(p)["athlete_id"].unique().to_list() for p in files] == [[A1], [A2], [A3]]
+    assert pl.read_parquet(files[0]).height == 200_003
+
+
+def test_part_writer_refuses_rows_out_of_order(tmp_path: Path):
+    import pyarrow as pa
+
+    t = lambda a: pa.table({"athlete_id": [a]})  # noqa: E731
+    with pytest.raises(ValueError, match="not in athlete_id order"):
+        with C.PartWriter(tmp_path, t(A1).schema, "table", "athlete_id", dataset="t", table_name="t") as w:
+            for a in (A1, A2, A1):
+                w.write(t(a))
+    assert list(tmp_path.iterdir()) == []  # nothing left behind
+    with pytest.raises(ValueError, match="rows of one athlete_id"):
+        with C.PartWriter(tmp_path, t(A1).schema, "table", "athlete_id", dataset="t", table_name="t") as w:
+            w.write(pa.table({"athlete_id": [A1, A2]}))
+
+
+def test_plan_parts():
+    assert C.plan_parts([3, 3, 3, 3, 1], target=5) == [range(0, 2), range(2, 4), range(4, 5)]
+    assert C.plan_parts([10, 1], target=5) == [range(0, 1), range(1, 2)]
+    assert C.plan_parts([], target=5) == []
 
 
 def test_writer_output_is_identical_whether_written_whole_or_in_pieces(tmp_path: Path):
@@ -140,8 +226,8 @@ def test_upload_refuses_when_the_folder_changed_after_the_check(built: Path):
 
 def test_a_failed_check_removes_the_record_of_an_earlier_pass(built: Path):
     assert migrate.stage_check(built, jobs=1, text_fraction=0.0, seed=0) == 0
-    path = built / "build" / "opendata" / "data" / "timeseries" / f"athlete_id={A1}" / "part.parquet"
-    df = pl.read_parquet(path, hive_partitioning=False).with_columns(pl.col("power_w") + 1)
+    path = built / "build" / "opendata" / "data" / "timeseries" / "part-00001.parquet"
+    df = pl.read_parquet(path).with_columns(pl.col("power_w") + 1)
     C.write_table(df.to_arrow(), path, "timeseries", dataset="opendata", table_name="timeseries")
     assert migrate.stage_check(built, jobs=1, text_fraction=0.0, seed=0) == 1
     assert not migrate.Build(built).check_record.exists()
@@ -153,7 +239,7 @@ def test_the_upload_folder_is_the_checked_folder_with_the_card_for_the_target_re
     files = migrate.checked_files(b)
     folder = migrate.stage_upload_folder(b, files, "someone/opendata-test")
     assert set(migrate.folder_files(folder)) == set(files)
-    part = f"data/timeseries/athlete_id={A1}/part.parquet"
+    part = "data/timeseries/part-00000.parquet"
     assert (folder / part).stat().st_ino == (b.repo / part).stat().st_ino  # a hard link, not a copy
     card = (folder / "README.md").read_text()
     assert "hf://datasets/someone/opendata-test/data/" in card
@@ -190,6 +276,7 @@ def test_every_file_the_card_points_at_exists(built: Path):
     repo = built / "build" / "opendata"
     card = re.sub(r'"\s*\n\s*"', "", (repo / "README.md").read_text())  # join "..." "..." literals
     paths = re.findall(r"hf://datasets/[^/]+/[^/]+/([^\"']+)", card)
-    assert len(paths) >= 4 and any("athlete_id=" in p for p in paths)
+    assert len(paths) >= 4 and "data/timeseries/*.parquet" in paths
+    assert A1 in card or A2 in card  # the examples read an athlete that is in the dataset
     for p in paths:
         assert list(repo.glob(p)), f"the card shows {p}, which matches no file"

@@ -10,7 +10,7 @@ name = "opendata"
 repo_id = "GoldenCheetah/opendata"
 pretty_name = "GoldenCheetah OpenData"
 license = "cc0-1.0"
-conventions = "0.3"
+conventions = "0.4"
 
 # --- athletes ------------------------------------------------------------------------
 [tables.athletes]
@@ -56,7 +56,7 @@ description = "GoldenCheetah metrics, one column per metric, names as GoldenChee
 [tables.timeseries]
 description = "One row per sample, as recorded: mostly 1 Hz, gaps not filled. Exact: every value equals the original CSV value (see the card)."
 profile = "timeseries"
-partition_by = "athlete_id"
+cluster_by = "athlete_id"                     # sorted by athlete, each athlete in one part file
 key = []  # samples have no key of their own; (athlete_id, activity_id, row order) identifies them
 columns = [
     { name = "athlete_id", required = true },

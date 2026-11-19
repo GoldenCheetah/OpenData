@@ -9,8 +9,9 @@
         --against datasets/opendata/dataset.toml <opendata folder>
 
 A template: it shows how a dataset is built with the shared tooling. Tables are written with
-conventions.write_table / TableWriter (the writer settings, file metadata and atomic writes come
-with them), the card is rendered from README.md.tmpl and dataset.toml, and memory stays bounded by
+conventions.write_table, and the time series with PartWriter: sorted by athlete, each athlete in
+one part file of about 500 MB (the writer settings, file metadata and atomic writes come with
+them). The card is rendered from README.md.tmpl and dataset.toml, and memory stays bounded by
 processing one activity at a time. Replace the transformation with your own.
 """
 
@@ -31,24 +32,29 @@ import conventions as C  # noqa: E402
 SPEC = C.load_dataset_spec(HERE / "dataset.toml")
 
 
-def iter_activities(path: Path, columns: list[str]) -> Iterator[tuple[str, pl.DataFrame]]:
-    """(activity_id, rows) for each activity in a time series file, reading it in batches.
+def iter_activities(path: Path, columns: list[str]) -> Iterator[tuple[tuple[str, str], pl.DataFrame]]:
+    """((athlete_id, activity_id), rows) for each activity in a time series file, in batches.
 
     The conventions keep an activity's rows contiguous, so an activity is complete when the next
-    one starts: memory is bounded by the largest activity, not by the athlete."""
+    one starts: memory is bounded by the largest activity, not by the file."""
     pending: list[pl.DataFrame] = []
+
+    def key(df: pl.DataFrame) -> tuple[str, str]:
+        return df["athlete_id"][0], df["activity_id"][0]
+
     for batch in pq.ParquetFile(path).iter_batches(batch_size=65_536, columns=columns):
         df = pl.from_arrow(batch)
         while df.height:
-            aid = df["activity_id"][0]
-            n = df.height if (df["activity_id"] == aid).all() else int((df["activity_id"] != aid).arg_true()[0])
-            if pending and pending[0]["activity_id"][0] != aid:
-                yield pending[0]["activity_id"][0], pl.concat(pending)
+            k = key(df)
+            other = (df["athlete_id"] != k[0]) | (df["activity_id"] != k[1])
+            n = int(other.arg_true()[0]) if other.any() else df.height
+            if pending and key(pending[0]) != k:
+                yield key(pending[0]), pl.concat(pending)
                 pending = []
             pending.append(df.head(n))
             df = df.slice(n)
     if pending:
-        yield pending[0]["activity_id"][0], pl.concat(pending)
+        yield key(pending[0]), pl.concat(pending)
 
 
 def resample(rows: pl.DataFrame) -> pl.DataFrame:
@@ -71,28 +77,23 @@ def build(opendata: Path, out: Path) -> None:
         raise SystemExit(f"{out} is not empty; build into a new folder")
     ts = SPEC.tables["timeseries"]
     durations: list[dict] = []
-    for path in sorted(opendata.glob(ts.glob)):  # one opendata file per athlete, in athlete order
-        athlete_id = path.parent.name.split("=", 1)[1]
-        target = out / C.partition_file("timeseries", "athlete_id", athlete_id)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with C.TableWriter(target, ts.arrow_schema(), ts.profile, dataset=SPEC.name,
-                           table_name="timeseries", encodings=ts.encodings) as w:
-            for aid, rows in iter_activities(path, ["athlete_id", "activity_id", "time_s", "power_w", "hr_bpm"]):
+    with C.PartWriter(out / "data" / "timeseries", ts.arrow_schema(), ts.profile, ts.cluster_by,
+                      dataset=SPEC.name, table_name="timeseries", encodings=ts.encodings) as w:
+        for path in sorted(opendata.glob(ts.glob)):  # opendata's part files, in athlete order
+            for (athlete_id, aid), rows in iter_activities(
+                    path, ["athlete_id", "activity_id", "time_s", "power_w", "hr_bpm"]):
                 grid = resample(rows)
                 if grid.height:
-                    w.write(grid.to_arrow().cast(w.schema))
+                    w.write(grid.to_arrow())
                     durations.append({"athlete_id": athlete_id, "activity_id": aid, "duration_s": float(grid.height)})
-        if w.rows == 0:
-            target.unlink()
-            target.parent.rmdir()
 
     durations_df = pl.DataFrame(durations, schema={"athlete_id": pl.String, "activity_id": pl.String,
                                                    "duration_s": pl.Float32})
-    activities = (pl.read_parquet(opendata / C.table_glob("activities", None),
+    activities = (pl.read_parquet(opendata / C.table_glob("activities"),
                                   columns=["athlete_id", "activity_id", "start_time_utc", "sport"])
                   .join(durations_df, on=["athlete_id", "activity_id"], how="inner")
                   .sort("athlete_id", "activity_id"))
-    athletes = (pl.read_parquet(opendata / C.table_glob("athletes", None), columns=["athlete_id", "gender", "yob"])
+    athletes = (pl.read_parquet(opendata / C.table_glob("athletes"), columns=["athlete_id", "gender", "yob"])
                 .filter(pl.col("athlete_id").is_in(activities["athlete_id"].unique().implode()))
                 .sort("athlete_id"))
     for name, df in (("activities", activities), ("athletes", athletes)):

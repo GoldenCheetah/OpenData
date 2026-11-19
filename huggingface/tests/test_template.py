@@ -45,13 +45,13 @@ def test_the_template_builds_a_dataset_that_passes_validation(example: Path, ope
 
 
 def test_the_template_resamples_to_whole_seconds(example: Path):
-    ts = pl.read_parquet(example / "data" / "timeseries" / f"athlete_id={A1}" / "part.parquet", hive_partitioning=False)
-    first = ts.filter(pl.col("activity_id") == "2019_03_02_08_00_00")
+    ts = pl.read_parquet(example / "data" / "timeseries" / "*.parquet")
+    first = ts.filter((pl.col("athlete_id") == A1) & (pl.col("activity_id") == "2019_03_02_08_00_00"))
     # source: (0, 100 W), (1, 150.5 W), (2.52, sub-normal -> 0 W): one row per second, first sample wins
     assert first["time_s"].to_list() == [0.0, 1.0, 2.0]
     assert first["power_w"].to_list() == [100.0, 150.5, 0.0]
     acts = pl.read_parquet(example / "data" / "activities" / "*.parquet")
-    assert not (example / "data" / "timeseries" / f"athlete_id={A3}").exists()
+    assert A3 not in set(ts["athlete_id"])  # no samples
     assert set(acts["athlete_id"]) == set(pl.read_parquet(example / "data" / "athletes" / "*.parquet")["athlete_id"])
 
 
@@ -69,7 +69,7 @@ def test_relations_to_another_dataset_need_it(example: Path, capsys):
 
 
 def rewrite(path: Path, table: str, change) -> None:
-    df = change(pl.read_parquet(path, hive_partitioning=False))
+    df = change(pl.read_parquet(path))
     t = C.load_dataset_spec(SPEC).tables[table]
     C.write_table(df.to_arrow(), path, t.profile, dataset="example", table_name=table, encodings=t.encodings)
 

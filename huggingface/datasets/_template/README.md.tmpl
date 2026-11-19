@@ -27,7 +27,7 @@ shared columns (`power_w`, `hr_bpm`, ...) have the same name, type, unit and mea
 import polars as pl
 
 acts = pl.read_parquet("hf://datasets/{{repo_id}}/data/activities/*.parquet")
-ts = pl.scan_parquet("hf://datasets/{{repo_id}}/data/timeseries/*/*.parquet")
+ts = pl.scan_parquet("hf://datasets/{{repo_id}}/data/timeseries/*.parquet")
 ```
 
 ## Data dictionary

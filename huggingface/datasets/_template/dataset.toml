@@ -14,7 +14,7 @@ name = "example"                              # lower snake_case; how other data
 repo_id = "GoldenCheetah/example"             # the Hugging Face dataset repo
 pretty_name = "GoldenCheetah OpenData, resampled (example)"
 license = "cc0-1.0"
-conventions = "0.3"                           # the conventions version this dataset follows
+conventions = "0.4"                           # the conventions version this dataset follows
 
 [tables.athletes]
 description = "One row per athlete with at least one activity in this dataset."
@@ -40,7 +40,7 @@ columns = [
 [tables.timeseries]
 description = "One row per second of each activity: the first sample recorded in that second, null where no sample was."
 profile = "timeseries"                        # the time series writer settings
-partition_by = "athlete_id"                   # one file per athlete
+cluster_by = "athlete_id"                     # sorted by athlete, each athlete in one part file
 key = []
 columns = [
     { name = "athlete_id", required = true },

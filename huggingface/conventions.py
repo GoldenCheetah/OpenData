@@ -31,7 +31,7 @@ from typing import Any
 
 # Version of these rules. Every dataset.toml names the version it follows; the validator applies
 # that version's rules. 0.x while nothing is published; 1.0 with the first public release.
-VERSION = "0.3"
+VERSION = "0.4"
 
 ROOT = Path(__file__).resolve().parent
 
@@ -142,19 +142,44 @@ NAME_RE = r"^[a-z][a-z0-9_]*$"
 SHARED_TABLES = {
     "athletes": "One row per athlete; key `athlete_id`.",
     "activities": "One row per activity; key `(athlete_id, activity_id)`.",
-    "timeseries": "One row per sample. One file per athlete: "
-                  "`data/timeseries/athlete_id=<uuid>/part.parquet`. Rows of an activity are "
-                  "contiguous and in recorded order, activities in `activity_id` order.",
+    "timeseries": "One row per sample, sorted by `athlete_id`, each athlete in one file: "
+                  "`data/timeseries/part-00000.parquet`, ... of about 500 MB. Rows of an activity "
+                  "are contiguous and in recorded order, activities in `activity_id` order.",
 }
 
 
-def table_glob(table: str, partition_by: str | None) -> str:
+def table_glob(table: str) -> str:
     """Files of a table, relative to the repo root (also the card's `data_files`)."""
-    return f"data/{table}/{partition_by}=*/*.parquet" if partition_by else f"data/{table}/*.parquet"
+    return f"data/{table}/*.parquet"
 
 
-def partition_file(table: str, partition_by: str, value: str) -> str:
-    return f"data/{table}/{partition_by}={value}/part.parquet"
+# Clustered tables (`cluster_by` in dataset.toml; the time series by athlete_id): rows sorted by
+# that column, all rows of one value in one file, files `part-00000.parquet`, `part-00001.parquet`,
+# ... A new file starts at the first value boundary after a file reaches PART_BYTES. Few large
+# files, because the Hub rate-limits requests per file (research/reports/14_hub_layouts.md); one
+# value per file, so readers skip the other files by their row-group statistics.
+PART_BYTES = 500 * 10**6
+PART_RE = r"^part-\d{5}\.parquet$"
+
+
+def part_name(i: int) -> str:
+    return f"part-{i:05d}.parquet"
+
+
+def plan_parts(sizes: list[int], target: int | None = None) -> list[range]:
+    """Split items (in order, with their sizes in bytes) into consecutive runs, one per file:
+    a run ends at the first item that brings it to `target` bytes. The rule PartWriter follows
+    while writing, for when the sizes are known beforehand (so files can be written in parallel)."""
+    target = target or PART_BYTES
+    runs, start, size = [], 0, 0
+    for i, n in enumerate(sizes):
+        size += n
+        if size >= target:
+            runs.append(range(start, i + 1))
+            start, size = i + 1, 0
+    if start < len(sizes):
+        runs.append(range(start, len(sizes)))
+    return runs
 
 
 # --- Parquet writer settings ---------------------------------------------------------
@@ -170,9 +195,10 @@ class WriterProfile:
 
 
 WRITER_PROFILES = {
-    # Long tables of measurements: byte-stream-split floats, dictionary-encoded ids, zstd 15,
-    # ~2 MB row groups so one athlete or activity can be read without much else.
-    "timeseries": WriterProfile(compression_level=15, row_group_size=256_000,
+    # Long tables of measurements: byte-stream-split floats, dictionary-encoded ids, zstd 15.
+    # 1M-row (~3.5 MB) row groups: each read over HTTP counts against the Hub's rate limits, so
+    # fewer is faster; 4M breaks the Dataset Viewer (research/reports/14_hub_layouts.md).
+    "timeseries": WriterProfile(compression_level=15, row_group_size=1_000_000,
                                 byte_stream_split=("float32", "float64"), dictionary="strings"),
     # Everything else: zstd, 100k-row row groups. Some tables are wide (hundreds of columns), and
     # the writer holds a row group in memory; Hugging Face's dataset viewer also prefers ~100k.
@@ -279,6 +305,11 @@ class TableWriter:
         self.buffered = rest.num_rows
         self.rows += n
 
+    @property
+    def bytes_written(self) -> int:
+        """Bytes of the row groups written so far (not counting the buffered rows)."""
+        return self.tmp.stat().st_size
+
     def close(self) -> None:
         if self.buffered:
             self._flush(self.buffered)
@@ -290,6 +321,77 @@ class TableWriter:
         self.tmp.unlink(missing_ok=True)
 
     def __enter__(self) -> TableWriter:
+        return self
+
+    def __exit__(self, exc_type: Any, *exc: Any) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self.abort()
+
+
+class PartWriter:
+    """Write a clustered table (see PART_BYTES) as part files in a folder, in bounded memory.
+
+    Pass the rows in `cluster_by` order, each `write` holding rows of one value (e.g. one activity
+    of one athlete); the rows of one value must come together. A new part file starts at the first
+    new value after a file reaches `target` bytes, so no value is split over files.
+
+        with PartWriter(folder, schema, "timeseries", "athlete_id", dataset=..., table_name=...) as w:
+            for piece in pieces:
+                w.write(piece)
+
+    The folder must not hold part files yet. Each file appears only when complete (TableWriter).
+    """
+
+    def __init__(self, folder: Path, schema: Any, profile: str, cluster_by: str, *, dataset: str,
+                 table_name: str, encodings: dict[str, str] | None = None, target: int | None = None):
+        self.folder = Path(folder)
+        if any(self.folder.glob("part-*.parquet")):
+            raise ValueError(f"{self.folder} already has part files")
+        self.args = (schema, profile)
+        self.kwargs = {"dataset": dataset, "table_name": table_name, "encodings": encodings}
+        self.cluster_by, self.target = cluster_by, target or PART_BYTES
+        self.writer: TableWriter | None = None
+        self.files: list[Path] = []
+        self.value: Any = None
+        self.done: set[Any] = set()
+
+    def write(self, table: Any) -> None:
+        import pyarrow.compute as pc
+
+        if table.num_rows == 0:
+            return
+        col = table.column(self.cluster_by)
+        if col.null_count or pc.count_distinct(col).as_py() != 1:
+            raise ValueError(f"each write holds rows of one {self.cluster_by} (no nulls)")
+        value = col[0].as_py()
+        if value != self.value:
+            if value in self.done or (self.value is not None and value < self.value):
+                raise ValueError(f"rows not in {self.cluster_by} order: {value!r} after {self.value!r}")
+            if self.value is not None:
+                self.done.add(self.value)
+            if self.writer is not None and self.writer.bytes_written >= self.target:
+                self.writer.close()
+                self.writer = None
+            self.value = value
+        if self.writer is None:
+            path = self.folder / part_name(len(self.files))
+            self.writer = TableWriter(path, *self.args, **self.kwargs)
+            self.files.append(path)
+        self.writer.write(table)
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+
+    def abort(self) -> None:
+        if self.writer is not None:
+            self.writer.abort()
+        for p in self.files[:-1]:
+            p.unlink(missing_ok=True)
+
+    def __enter__(self) -> PartWriter:
         return self
 
     def __exit__(self, exc_type: Any, *exc: Any) -> None:
@@ -338,12 +440,12 @@ class TableSpec:
     key: tuple[str, ...]
     columns: list[ColumnSpec]
     extra: ExtraColumns | None = None
-    partition_by: str | None = None
+    cluster_by: str | None = None  # rows sorted by this column, each value in one part file
     default: bool = False
 
     @property
     def glob(self) -> str:
-        return table_glob(self.name, self.partition_by)
+        return table_glob(self.name)
 
     @property
     def encodings(self) -> dict[str, str]:
@@ -473,14 +575,16 @@ def load_dataset_spec(path: Path) -> DatasetSpec:
             if bad or not e.get("types"):
                 errors.append(f"{where}.extra_columns: types must be a non-empty subset of {sorted(TYPES)}")
             extra = ExtraColumns(tuple(e.get("types", ())), e.get("description", ""), e.get("verbatim_names", False))
-        part = t.get("partition_by")
-        if part and part not in names:
-            errors.append(f"{where}: partition_by column {part!r} is not declared")
-        if tname in SHARED_TABLES and tname == "timeseries" and part != "athlete_id":
-            errors.append(f"{where}: the timeseries table is partitioned by athlete_id")
+        if "partition_by" in t:
+            errors.append(f"{where}: `partition_by` was replaced by `cluster_by` in conventions 0.4")
+        cluster = t.get("cluster_by")
+        if cluster and cluster not in names:
+            errors.append(f"{where}: cluster_by column {cluster!r} is not declared")
+        if tname == "timeseries" and cluster != "athlete_id":
+            errors.append(f"{where}: the timeseries table is clustered by athlete_id (`cluster_by = \"athlete_id\"`)")
         if not t.get("description"):
             errors.append(f"{where}: needs a description")
-        tables[tname] = TableSpec(tname, t.get("description", ""), profile, key, cols, extra, part,
+        tables[tname] = TableSpec(tname, t.get("description", ""), profile, key, cols, extra, cluster,
                                   t.get("default", False))
     if sum(t.default for t in tables.values()) != 1:
         errors.append("exactly one table needs `default = true` (the subset the dataset viewer opens)")
@@ -520,7 +624,8 @@ def data_dictionary(spec: DatasetSpec) -> str:
     for t in sorted(spec.tables.values(), key=lambda t: not t.default):
         out += [f"### `{t.name}`", "", cell(t.description), ""]
         key = f"key `({', '.join(t.key)})`" if t.key else "no key"
-        files = f"one file per `{t.partition_by}`: `{t.glob}`" if t.partition_by else f"`{t.glob}`"
+        files = (f"`{t.glob}`, sorted by `{t.cluster_by}`, each `{t.cluster_by}` in one file" if t.cluster_by
+                 else f"`{t.glob}`")
         out += [f"{key}; {files}", "", "| column | type | unit | description |", "|---|---|---|---|"]
         for c in t.columns:
             notes = []

@@ -10,13 +10,15 @@
 The dataset folder is what gets uploaded to Hugging Face: README.md (the card) and data/.
 Exit code 0 when every check passes, 1 otherwise. Checks:
 
-  layout     every declared table has files where the conventions put them; nothing else in data/
+  layout     every declared table has files where the conventions put them; nothing else in data/;
+             clustered tables (`cluster_by`) in part files part-00000.parquet, part-00001.parquet, ...
   schema     column names, order and types; shared columns as defined in conventions.py; verbatim
              column groups; the same schema in every file of a table
   writer     zstd, page index, byte-stream-split floats and row-group size for the table's profile;
              the `goldencheetah` file metadata (dataset, table, conventions version)
-  values     required columns without nulls; id patterns; unique keys; time series partition value,
-             activity order and contiguity; declared time_s guarantees (grid, monotonic)
+  values     required columns without nulls; id patterns; unique keys; clustered tables sorted by
+             their cluster column with each value in one file, activities contiguous and in order;
+             declared time_s guarantees (grid, monotonic)
   relations  every key referenced across tables exists (e.g. timeseries -> activities)
   across     for relations to another dataset's tables (`references = "opendata.activities"`),
              given with --against: every key exists there, and where rows match one to one,
@@ -83,6 +85,7 @@ class FileResult:
     findings: Findings
     keys: dict[tuple[str, ...], set[tuple]]   # distinct values of the column sets relations need
     key_rows: list[tuple] | None              # the table key of every row (tables with a key)
+    cluster_range: tuple | None = None        # first and last cluster value (clustered tables)
 
 
 def check_file(path: Path, root: Path, ds: C.DatasetSpec, t: C.TableSpec,
@@ -168,15 +171,16 @@ def check_file(path: Path, root: Path, ds: C.DatasetSpec, t: C.TableSpec,
     time_checks = bool(time_col and (time_col.grid or time_col.monotonic))
     needed = {c.name for c in t.columns if c.required or c.pattern}
     needed |= set(t.key) | {c for cols in relation_cols for c in cols}
-    if t.partition_by:
-        needed |= {t.partition_by, "activity_id"}
+    # rows are grouped by (cluster value, activity): both kept contiguous and in order
+    group = [c for c in (t.cluster_by, "activity_id") if c and c in names] if t.cluster_by else []
+    needed |= set(group)
     if time_checks:
-        needed |= {"activity_id", "time_s"}
+        needed |= {"activity_id", "time_s"} | set(group)
     needed = sorted(needed & set(names))
 
     nulls: dict[str, int] = defaultdict(int)
-    distinct: dict[str, set] = defaultdict(set)       # pattern and partition columns
-    runs: list[str] = []                              # activity_id of each run of rows, in order
+    distinct: dict[str, set] = defaultdict(set)       # pattern columns
+    runs: list[tuple] = []                            # each run of rows of one group, in order
     grid_off = backwards = 0
     time_example = None
     prev: pl.DataFrame | None = None                  # last row of the previous row group (time checks)
@@ -187,19 +191,20 @@ def check_file(path: Path, root: Path, ds: C.DatasetSpec, t: C.TableSpec,
         for c in t.columns:
             if c.name in df.columns and c.required:
                 nulls[c.name] += df[c.name].null_count()
-            if c.name in df.columns and (c.pattern or c.name == t.partition_by):
+            if c.name in df.columns and c.pattern:
                 distinct[c.name] |= set(df[c.name].drop_nulls().unique().to_list())
-        if t.partition_by and "activity_id" in df.columns and df.height:
-            aid = pl.col("activity_id")
-            r = df.select(aid.filter(aid != aid.shift(1).fill_null("")))
-            seq = r["activity_id"].to_list()
+        if group and df.height:
+            g = df.select(group)
+            starts = pl.any_horizontal(pl.col(c).ne_missing(pl.col(c).shift(1)) for c in group)
+            seq = list(g.filter(starts.fill_null(True)).iter_rows())
             if runs and seq and seq[0] == runs[-1]:
                 seq = seq[1:]                         # the same run continues across row groups
             runs += seq
         if time_checks and df.height:
-            cur = df.select("activity_id", "time_s")
+            by = group or ["activity_id"]
+            cur = df.select(*by, "time_s")
             ext = pl.concat([prev, cur]) if prev is not None else cur
-            d = ext.with_columns(step=pl.col("time_s").diff().over("activity_id")).slice(0 if prev is None else 1)
+            d = ext.with_columns(step=pl.col("time_s").diff().over(by)).slice(0 if prev is None else 1)
             if time_col.grid:
                 g = time_col.grid
                 bad = d.filter(((pl.col("time_s") / g).round(0) * g != pl.col("time_s"))
@@ -210,7 +215,7 @@ def check_file(path: Path, root: Path, ds: C.DatasetSpec, t: C.TableSpec,
                 backwards += bad.height
             if bad.height and time_example is None:
                 time_example = bad["activity_id"][0]
-            prev = df.select("activity_id", "time_s").tail(1)
+            prev = cur.tail(1)
         for cols in keys:
             keys[cols] |= set(df.select(cols).unique().iter_rows())
         if key_rows is not None:
@@ -224,16 +229,15 @@ def check_file(path: Path, root: Path, ds: C.DatasetSpec, t: C.TableSpec,
             bad_ids = sorted(v for v in distinct[c.name] if not re.search(c.pattern, v))
             if bad_ids:
                 f.add(t.name, "id format", f"{rel}: {c.name} {bad_ids[:3]}", len(bad_ids))
-    if t.partition_by and t.partition_by in distinct:
-        expected = path.parent.name.split("=", 1)[1]
-        if distinct[t.partition_by] != {expected}:
-            values = sorted(distinct[t.partition_by])[:3]
-            f.add(t.name, "partition value", f"{rel}: {t.partition_by} values {values} in folder {expected}")
-    if runs:
+    what = " and ".join(group)
+    if any(None in r for r in runs):
+        f.add(t.name, "nulls in cluster columns", f"{rel}: rows without {what}")
+    elif runs:
         if len(runs) != len(set(runs)):
-            f.add(t.name, "activity rows not contiguous", f"{rel}: {len(runs) - len(set(runs))} activities split")
+            f.add(t.name, "rows not contiguous", f"{rel}: {len(runs) - len(set(runs))} runs of {what} split")
         elif runs != sorted(runs):
-            f.add(t.name, "activity order", f"{rel}: activities not in activity_id order")
+            i = next(i for i in range(1, len(runs)) if runs[i] < runs[i - 1])
+            f.add(t.name, "row order", f"{rel}: not sorted by {what}: {runs[i]} after {runs[i - 1]}")
     if grid_off:
         f.add(t.name, "time_s grid",
               f"{rel}: {grid_off:,} samples off the {time_col.grid} s grid, e.g. activity {time_example}", grid_off)
@@ -241,7 +245,8 @@ def check_file(path: Path, root: Path, ds: C.DatasetSpec, t: C.TableSpec,
         f.add(t.name, "time_s monotonic",
               f"{rel}: {backwards:,} non-increasing steps, e.g. activity {time_example}", backwards)
 
-    return FileResult(rel, md.num_rows, tuple(types.items()), f, keys, key_rows)
+    cluster_range = (runs[0][0], runs[-1][0]) if runs and t.cluster_by else None
+    return FileResult(rel, md.num_rows, tuple(types.items()), f, keys, key_rows, cluster_range)
 
 
 def _low_priority() -> None:
@@ -263,10 +268,9 @@ def table_files(root: Path, t: C.TableSpec, f: Findings) -> list[Path]:
     stray = sorted(set(p for p in folder.rglob("*") if p.is_file()) - set(files))
     for p in stray:
         f.add(t.name, "layout", f"unexpected file {p.relative_to(root)}")
-    if t.partition_by:
-        for p in files:
-            if p.name != "part.parquet":
-                f.add(t.name, "layout", f"{p.relative_to(root)}: partition files are named part.parquet")
+    if t.cluster_by and [p.name for p in files] != [C.part_name(i) for i in range(len(files))]:
+        f.add(t.name, "layout", f"files {[p.name for p in files][:3]}...: a clustered table is in "
+                                f"{C.part_name(0)}, {C.part_name(1)}, ... numbered from 0 without gaps")
     if not files:
         f.add(t.name, "layout", f"no files matching {t.glob}")
     return files
@@ -327,7 +331,7 @@ def check_other_dataset(r: C.Relation, t: C.TableSpec, root: Path, keys: set[tup
         f.add(r.table, check, f"{r.references} has no column {missing_cols}")
         return
     on = list(r.on)
-    ref = pl.scan_parquet(table_source(location, ot), hive_partitioning=False).select(on).unique().collect()
+    ref = pl.scan_parquet(table_source(location, ot)).select(on).unique().collect()
     missing = keys - set(ref.iter_rows())
     if missing:
         f.add(r.table, check, f"{len(missing):,} {r.on} values not in {r.references}, e.g. {sorted(missing)[0]}",
@@ -337,8 +341,8 @@ def check_other_dataset(r: C.Relation, t: C.TableSpec, root: Path, keys: set[tup
     shared = [c.name for c in t.columns if c.name in C.SHARED_COLUMNS and c.name in ocols and c.name not in on]
     if not shared:
         return
-    here = pl.scan_parquet(table_source(root, t), hive_partitioning=False).select(on + shared)
-    there = pl.scan_parquet(table_source(location, ot), hive_partitioning=False).select(on + shared)
+    here = pl.scan_parquet(table_source(root, t)).select(on + shared)
+    there = pl.scan_parquet(table_source(location, ot)).select(on + shared)
     j = here.join(there, on=on, how="inner", suffix="__other").collect()
     for c in shared:
         differ = j.filter(~pl.col(c).eq_missing(pl.col(f"{c}__other")))
@@ -400,6 +404,11 @@ def validate(spec_path: Path, root: Path, jobs: int, max_files: int | None,
                         seen_key_rows.add(row)
             if dup:
                 findings.counts[(name, "duplicate keys")] += dup
+            ranges = [(r.path, r.cluster_range) for r in results if r.cluster_range]
+            for (a, ra), (b, rb) in zip(ranges, ranges[1:], strict=False):
+                if not ra[1] < rb[0]:  # files in name order hold increasing, disjoint values
+                    findings.add(name, "row order", f"{t.cluster_by} {rb[0]!r} at the start of {b} "
+                                                    f"is not after {ra[1]!r} at the end of {a}")
             if len(schemas) > 1:
                 variants = sorted(schemas.values(), key=len)
                 findings.add(name, "schema differs between files",

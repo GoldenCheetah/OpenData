@@ -9,6 +9,8 @@ Every stage is resumable and safe to re-run; the files in the work directory are
   listing   fetch the OSF file listing (ids, sizes, sha256)  -> <workdir>/osf/listing.parquet
   mirror    download every athlete zip and verify its sha256 -> <workdir>/osf/athletes/<uuid>.zip
   convert   zips -> the dataset folder to upload              -> <workdir>/build/opendata/
+            (time series first per athlete into <workdir>/build/staging/, then packed into
+            part files of about 500 MB, sorted by athlete)
   check     validate it, and compare every time series value with the original CSVs
                                                              -> <workdir>/build/check.json
   upload    upload exactly the checked dataset folder to a Hugging Face dataset repo, and
@@ -27,9 +29,11 @@ dataset folder as it is now, and creates the repo as private if it doesn't exist
 holds exactly the dataset folder: remote files that aren't in it are deleted. Interrupted uploads
 resume when run again.
 
-`convert` converts an athlete again only when its zip or the converter version changed. It stops
-before writing the metadata tables if any athlete can't be converted (unknown quirks fail loudly);
-`--allow-errors` leaves those athletes out instead.
+`convert` converts an athlete again only when its zip or the converter version changed, and packs
+the time series again only when an athlete's staged file changed (an interrupted packing resumes
+with the part files it hasn't finished). It stops before writing the metadata tables if any
+athlete can't be converted (unknown quirks fail loudly); `--allow-errors` leaves those athletes
+out instead.
 
 The full mirror is 6,613 zips / 115.6 GB: ~19 h at the ~1.6 MB/s OSF gives 3 workers. For an
 unattended run on macOS that keeps the machine awake (caffeinate: no idle/system sleep while on
@@ -497,6 +501,11 @@ class Build:
         return self.root / "manifest.jsonl"
 
     @property
+    def parts_plan(self) -> Path:
+        """Which athletes are in which time series part file, and the staged files they came from."""
+        return self.root / "timeseries_parts.json"
+
+    @property
     def check_record(self) -> Path:
         return self.root / "check.json"
 
@@ -508,7 +517,11 @@ class Build:
         return self.workdir / "osf" / "athletes" / f"{athlete_id}.zip"
 
     def ts_file(self, athlete_id: str) -> Path:
-        return self.repo / C.partition_file("timeseries", "athlete_id", athlete_id)
+        """The athlete's converted time series, before packing into part files."""
+        return self.staging / "timeseries" / f"{athlete_id}.parquet"
+
+    def ts_part(self, i: int) -> Path:
+        return self.repo / "data" / "timeseries" / C.part_name(i)
 
     def exc_file(self, athlete_id: str) -> Path:
         return self.staging / "exceptions" / f"{athlete_id}.parquet"
@@ -527,7 +540,7 @@ def load_manifest(path: Path) -> dict[str, dict]:
 
 
 def convert_timeseries_worker(athlete_id: str, sha256: str, workdir: str) -> dict:
-    """Time series of one athlete -> its partition file + staged exceptions. Runs in a subprocess.
+    """Time series of one athlete -> its staged file + staged exceptions. Runs in a subprocess.
 
     Streams one activity at a time into the file, so memory stays bounded by the largest activity
     whatever the athlete's size (the writer buffers at most one row group).
@@ -554,8 +567,8 @@ def convert_timeseries_worker(athlete_id: str, sha256: str, workdir: str) -> dic
                     writer.write(out.to_arrow())
         if writer is not None:
             writer.close()
-        elif path.exists():
-            shutil.rmtree(path.parent)
+        else:
+            path.unlink(missing_ok=True)
     except gcod.GcodError as e:
         if writer is not None:
             writer.abort()
@@ -702,10 +715,6 @@ def stage_convert(workdir: Path, jobs: int, athletes: list[str] | None, athletes
                                 [manifest[a].get("csvs", {}) for a in ok_ids], chunksize=8):
                 for k, v in fm.items():
                     forms.setdefault(k, set()).update(v)
-    # time series files of athletes not in this dataset must not linger in the output
-    for d in (b.repo / "data" / "timeseries").glob("athlete_id=*"):
-        if d.name.split("=", 1)[1] not in set(ok_ids):
-            shutil.rmtree(d)
     kinds = gcod.metric_kinds(forms)
     log(f"metadata: {len(kinds)} metrics ({sum(k == 'scalar' for k in kinds.values())} scalar, "
         f"{sum(k == 'pair' for k in kinds.values())} value+weight, {sum(k == 'list' for k in kinds.values())} list)")
@@ -804,7 +813,11 @@ def _write_metadata_tables(b: Build, sel: pl.DataFrame, ok_ids: list[str], kinds
     for t, d in tmp.items():
         _replace_dir(d, b.repo / "data" / t)
 
-    # 4. dataset card
+    # 4. time series: the staged per-athlete files packed into part files
+    if pack_timeseries(b, [a for a in ok_ids if manifest[a]["rows"]], jobs) != 0:
+        return 130
+
+    # 5. dataset card
     n_rows = sum(manifest[a]["rows"] for a in ok_ids)
     write_card(b.repo, athletes_df, n_rows, n_metrics=len(kinds))
     log(f"convert: done. {len(ok_ids):,} athletes, {athletes_df['n_activities'].sum():,} activities, "
@@ -814,12 +827,83 @@ def _write_metadata_tables(b: Build, sel: pl.DataFrame, ok_ids: list[str], kinds
     return 0
 
 
+def timeseries_plan(b: Build, athletes: list[str]) -> dict:
+    """Athletes (sorted) per part file, by the conventions' rule on their staged file sizes; with
+    each staged file's size and mtime, so a changed athlete means packing again."""
+    staged = {a: b.ts_file(a).stat() for a in sorted(athletes)}
+    ids = list(staged)
+    parts = [[ids[i] for i in r] for r in C.plan_parts([st.st_size for st in staged.values()])]
+    return {"conventions": C.VERSION, "parts": parts,
+            "staged": {a: [st.st_size, st.st_mtime_ns] for a, st in staged.items()}}
+
+
+def load_plan(b: Build) -> dict | None:
+    return json.loads(b.parts_plan.read_text()) if b.parts_plan.exists() else None
+
+
+def pack_worker(out: str, sources: list[str]) -> int:
+    """Concatenate whole staged athlete files, in order, into one part file. Returns its rows."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    _low_priority()
+    ts = SPEC.tables["timeseries"]
+    with C.TableWriter(Path(out), ts.arrow_schema(), ts.profile, dataset=SPEC.name, table_name="timeseries",
+                       encodings=ts.encodings) as w:
+        for src in sources:
+            for batch in pq.ParquetFile(src).iter_batches(batch_size=65_536):
+                w.write(pa.Table.from_batches([batch]))
+    return w.rows
+
+
+def pack_timeseries(b: Build, athletes: list[str], jobs: int) -> int:
+    """Pack the staged time series of `athletes` into data/timeseries/part-*.parquet (0, or 130
+    when stopped). Skipped when the folder already holds this plan; resumes an interrupted run."""
+    plan = timeseries_plan(b, athletes)
+    final, tmp = b.repo / "data" / "timeseries", b.repo / "data" / "timeseries.tmp"
+    expected = [C.part_name(i) for i in range(len(plan["parts"]))]
+    if load_plan(b) == plan and not tmp.exists() and sorted(p.name for p in final.glob("*")) == expected:
+        log(f"timeseries: {len(expected)} part files up to date")
+        return 0
+    if load_plan(b) != plan or not tmp.exists():
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir(parents=True)
+        b.parts_plan.write_text(json.dumps(plan) + "\n")
+    for leftover in tmp.glob("*.tmp"):  # a part being written when the last run stopped
+        leftover.unlink()
+    todo = [i for i, name in enumerate(expected) if not (tmp / name).exists()]
+    log(f"timeseries: packing {len(athletes):,} athletes into {len(expected)} part files "
+        f"({len(expected) - len(todo)} already done) ...")
+    t0 = time.monotonic()
+    with ProcessPoolExecutor(jobs) as ex:
+        futs = {ex.submit(pack_worker, str(tmp / expected[i]), [str(b.ts_file(a)) for a in plan["parts"][i]]): i
+                for i in todo}
+        for n, f in enumerate(as_completed(futs), 1):
+            f.result()
+            if STOP.is_set():
+                ex.shutdown(cancel_futures=True)
+                log("stopped; re-run to resume")
+                return 130
+            el = time.monotonic() - t0
+            log(f"timeseries: {n}/{len(todo)} part files, ETA {human_duration(el / n * (len(todo) - n))}")
+    _replace_dir(tmp, final)
+    return 0
+
+
 def write_card(repo: Path, athletes: pl.DataFrame, n_rows: int, n_metrics: int) -> None:
     """README.md from README.md.tmpl: every number in the card comes from this build."""
     import pyarrow as pa
 
     upload_years = athletes["osf_date_created"].dt.year()
-    example = athletes.sort(["n_timeseries", "athlete_id"], descending=[True, False])["athlete_id"][0]
+    # the usage examples read an athlete and an activity that exist: a typical athlete (median
+    # number of time series) and its most recent activity with a time series
+    with_ts = athletes.filter(pl.col("n_timeseries") > 0).sort("n_timeseries", "athlete_id")
+    example = with_ts["athlete_id"][with_ts.height // 2]
+    example_activity = (pl.read_parquet(repo / "data" / "activities" / "*.parquet",
+                                        columns=["athlete_id", "activity_id", "has_timeseries"])
+                        .filter((pl.col("athlete_id") == example) & pl.col("has_timeseries"))["activity_id"].max())
+    ts_bytes = sum(p.stat().st_size for p in (repo / "data" / "timeseries").glob("*.parquet"))
     values = {
         "n_athletes": f"{athletes.height:,}",
         "n_activities": f"{athletes['n_activities'].sum():,}",
@@ -828,7 +912,9 @@ def write_card(repo: Path, athletes: pl.DataFrame, n_rows: int, n_metrics: int) 
         "size_category": C.size_category(n_rows),
         "first_upload_year": str(upload_years.min()),
         "last_upload_year": str(upload_years.max()),
-        "example_athlete_id": example,  # the usage example reads a file that exists
+        "example_athlete_id": example,
+        "example_activity_id": example_activity,
+        "timeseries_size": human_bytes(ts_bytes),
         "code_url": "https://github.com/GoldenCheetah/OpenData/tree/master/huggingface",
         "converter_version": gcod.CONVERTER_VERSION,
         "libraries": f"polars {pl.__version__}, pyarrow {pa.__version__}",
@@ -866,27 +952,43 @@ class _RowStream:
         return self.n == 0 and next(self.batches, None) is None
 
 
-def check_worker(athlete_id: str, workdir: str, text_level: bool) -> dict:
-    """Compare one athlete's written time series, read back from disk, with the source CSVs.
+def check_worker(part: int, athletes: list[str], workdir: str, text_level: set[str]) -> dict:
+    """Compare one time series part file, read back from disk, with the source CSVs of the
+    athletes it holds, in order: every row is accounted for, and nothing else is in the file.
 
-    Every value: the stored Float32 is the Float32 of the source value. With `text_level`, also
-    that it prints back as the source number (slow). Streams activity by activity.
+    Every value: the stored Float32 is the Float32 of the source value. For the athletes in
+    `text_level`, also that it prints back as the source number (slow). Streams activity by
+    activity.
     """
     _low_priority()
     b = Build(Path(workdir))
+    stream = _RowStream(b.ts_part(part))
+    values = differ = 0
+    problems: dict[str, str] = {}
+    for athlete_id in athletes:
+        v, d, error = _check_athlete(b, stream, athlete_id, athlete_id in text_level)
+        values, differ = values + v, differ + d
+        if error or d:
+            problems[athlete_id] = error or f"{d:,} values differ"
+        if error:
+            break  # the rows after this no longer line up
+    if not problems and not stream.exhausted():
+        problems[C.part_name(part)] = "the file has more rows than the CSVs"
+    return {"part": part, "values": values, "differ": differ, "problems": problems}
+
+
+def _check_athlete(b: Build, stream: _RowStream, athlete_id: str, text_level: bool) -> tuple[int, int, str | None]:
+    """(values compared, values that differ, error) for the next athlete in a part file."""
     exc_path = b.exc_file(athlete_id)
     exc = pl.read_parquet(exc_path) if exc_path.exists() else pl.DataFrame(schema=gcod.EXCEPTIONS_SCHEMA)
-    stream = _RowStream(b.ts_file(athlete_id))
     values = differ = 0
-    errors = []
     with gcod.open_athlete_zip(b.zip_path(athlete_id)) as az:
         for aid, src in gcod.iter_source_activities(az):
             if src.height == 0:
                 continue
             out = stream.take(src.height)
-            if out.height != src.height or (out["activity_id"] != aid).any():
-                errors.append(f"activity {aid}: rows don't line up with the CSV")
-                break
+            if out.height != src.height or (out["activity_id"] != aid).any() or (out["athlete_id"] != athlete_id).any():
+                return values, differ, f"activity {aid}: rows don't line up with the CSV"
             values += src.height * len(gcod.TS_COLUMNS)
             exc_a = exc.filter(pl.col("activity_id") == aid)
             differ += gcod.cast_mismatches(src, out)
@@ -898,10 +1000,7 @@ def check_worker(athlete_id: str, workdir: str, text_level: bool) -> dict:
                                 variable_name="source_column", value_name="v"),
                     on=["activity_id", "row_in_activity", "source_column"], how="left")
                 differ += restored.filter(pl.col("v") != pl.col("source_value")).height + restored["v"].null_count()
-    if not errors and not stream.exhausted():
-        errors.append("the file has more rows than the CSVs")
-    return {"athlete_id": athlete_id, "values": values, "differ": differ,
-            "error": "; ".join(errors) or None, "text_level": text_level}
+    return values, differ, None
 
 
 def stage_check(workdir: Path, jobs: int, text_fraction: float, seed: int) -> int:
@@ -911,27 +1010,40 @@ def stage_check(workdir: Path, jobs: int, text_fraction: float, seed: int) -> in
     status = validate.validate(SPEC_PATH, b.repo, jobs, None)
 
     manifest = load_manifest(b.manifest)
-    present = sorted(d.name.split("=", 1)[1] for d in (b.repo / "data" / "timeseries").glob("athlete_id=*"))
-    ids = [a for a in present if manifest.get(a, {}).get("status") == "ok"]
+    plan = load_plan(b) or {"parts": []}
+    parts = plan["parts"]
+    ids = [a for p in parts for a in p]
+    problems: dict[str, str] = {}
+    present = sorted(p.name for p in (b.repo / "data" / "timeseries").glob("*.parquet"))
+    if present != [C.part_name(i) for i in range(len(parts))]:
+        problems["data/timeseries"] = f"{len(present)} part files, the packing plan has {len(parts)}; run `convert`"
+    athletes = b.repo / "data" / "athletes"
+    in_dataset = set(pl.read_parquet(athletes / "*.parquet", columns=["athlete_id"])["athlete_id"]) \
+        if any(athletes.glob("*.parquet")) else set()
+    with_rows = [a for a, m in sorted(manifest.items()) if m.get("status") == "ok" and m.get("rows")]
+    if ids != [a for a in with_rows if a in in_dataset]:
+        problems["data/timeseries"] = "the part files don't hold exactly the athletes with time series; run `convert`"
     text_ids = set(random.Random(seed).sample(ids, round(len(ids) * text_fraction))) if ids else set()
-    log(f"check: every time series value of {len(ids):,} athletes against the original CSVs "
-        f"(text level for {len(text_ids):,}) ...")
+    log(f"check: every time series value of {len(ids):,} athletes in {len(parts)} part files against the "
+        f"original CSVs (text level for {len(text_ids):,}) ...")
     total = differ = 0
-    problems = []
-    with ProcessPoolExecutor(jobs) as ex:
-        for r in ex.map(check_worker, ids, [str(workdir)] * len(ids), [a in text_ids for a in ids], chunksize=1):
-            total += r["values"]
-            if r["error"] or r["differ"]:
-                problems.append(r)
-            differ += r["differ"] or 0
-    for r in problems[:20]:
-        detail = r["error"] or f"{r['differ']:,} values differ"
-        log(f"  {r['athlete_id']}: {detail}")
+    if not problems:
+        with ProcessPoolExecutor(jobs) as ex:
+            futs = [ex.submit(check_worker, i, p, str(workdir), text_ids & set(p)) for i, p in enumerate(parts)]
+            for n, f in enumerate(as_completed(futs), 1):
+                r = f.result()
+                total += r["values"]
+                differ += r["differ"]
+                problems |= r["problems"]
+                if n % 10 == 0 or n == len(futs):
+                    log(f"check: {n}/{len(futs)} part files")
+    for where, detail in list(problems.items())[:20]:
+        log(f"  {where}: {detail}")
 
     # every activity that says it has a time series has samples, and vice versa
     acts = pl.read_parquet(b.repo / "data" / "activities" / "*.parquet",
-                           columns=["athlete_id", "activity_id", "has_timeseries"])
-    in_dataset = set(acts["athlete_id"].unique())
+                           columns=["athlete_id", "activity_id", "has_timeseries"]) if in_dataset else \
+        pl.DataFrame(schema={"athlete_id": pl.String, "activity_id": pl.String, "has_timeseries": pl.Boolean})
     counts = pl.DataFrame([{"athlete_id": a, "activity_id": k, "n": c["rows"]}
                            for a in in_dataset for k, c in manifest[a].get("csvs", {}).items()],
                           schema={"athlete_id": pl.String, "activity_id": pl.String, "n": pl.Int64})
@@ -939,7 +1051,7 @@ def stage_check(workdir: Path, jobs: int, text_fraction: float, seed: int) -> in
     mismatch = j.filter(pl.col("has_timeseries") != (pl.col("n") > 0)).height
 
     log(f"check: {total:,} values in {len(ids):,} athletes compared, {differ:,} differ; "
-        f"{len(problems)} athletes with problems; has_timeseries mismatches: {mismatch}")
+        f"{len(problems)} problems; has_timeseries mismatches: {mismatch}")
     ok = status == 0 and not problems and mismatch == 0
     b.check_record.unlink(missing_ok=True)
     if ok:  # what passed, file by file: `upload` uploads exactly this
@@ -1054,7 +1166,7 @@ def stage_upload(workdir: Path, repo_id: str) -> int:
     card = (folder / "README.md").read_bytes()
     expected = {**files, "README.md": {"size": len(card), "sha256": hashlib.sha256(card).hexdigest(),
                                        "git_sha1": git_blob_sha1(card)}}
-    n_athletes = sum(rel.startswith("data/timeseries/") for rel in files)
+    n_athletes = sum(len(p) for p in (load_plan(b) or {"parts": []})["parts"])
     message = (f"OpenData: converter {gcod.CONVERTER_VERSION}, conventions {C.VERSION}, "
                f"{n_athletes:,} athletes with time series")
     commit = api.upload_folder(repo_id=repo_id, repo_type="dataset", folder_path=folder,

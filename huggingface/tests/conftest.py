@@ -100,10 +100,15 @@ def write_workdir(workdir: Path, zip_paths: list[Path]) -> None:
 
 
 @pytest.fixture
-def built(tmp_path: Path, zips: Path) -> Path:
-    """A migrate.py work directory after `convert` of two basic athletes and an empty one."""
+def built(tmp_path: Path, zips: Path, monkeypatch) -> Path:
+    """A migrate.py work directory after `convert` of two basic athletes and an empty one.
+
+    With 1-byte part files, so that each athlete's time series is in its own part file (as with
+    the full release) and the layout over several files gets tested."""
+    import conventions
     import migrate
 
+    monkeypatch.setattr(conventions, "PART_BYTES", 1)
     workdir = tmp_path / "work"
     paths = [basic_athlete(zips, A1), basic_athlete(zips, A2), make_zip(zips / f"{A3}.zip", [], {})]
     write_workdir(workdir, paths)
